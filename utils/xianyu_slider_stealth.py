@@ -12,6 +12,7 @@ import os
 import math
 import threading
 import tempfile
+import platform
 import shutil
 from datetime import datetime
 from playwright.sync_api import sync_playwright, ElementHandle
@@ -315,11 +316,39 @@ class XianyuSliderStealth:
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
             
-            # 启动浏览器，使用随机特征
-            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
-            self.browser = self.playwright.chromium.launch(
-                headless=self.headless,
-                args=[
+            # 本地人工验证优先使用系统安装的正式版 Chrome。Chrome for Testing
+            # 带有明显的自动化启动特征，闲鱼滑块经常会直接拒绝人工拖动。
+            system_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            use_system_chrome = (
+                not self.headless
+                and platform.system() == "Darwin"
+                and os.path.exists(system_chrome)
+                and os.getenv("XIANYU_USE_SYSTEM_CHROME", "1") != "0"
+            )
+
+            if use_system_chrome:
+                logger.info(
+                    f"【{self.pure_user_id}】启动系统 Google Chrome 人工验证窗口"
+                )
+                self.browser = self.playwright.chromium.launch(
+                    executable_path=system_chrome,
+                    headless=False,
+                    ignore_default_args=["--enable-automation"],
+                    args=[
+                        "--start-maximized",
+                        f"--window-size={browser_features['window_size']}",
+                        f"--lang={browser_features['lang']}",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+            else:
+                # 无头自动模式保留原有兼容参数。
+                logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
+                self.browser = self.playwright.chromium.launch(
+                    headless=self.headless,
+                    args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
@@ -372,8 +401,8 @@ class XianyuSliderStealth:
                     "--unsafely-disable-devtools-self-xss-warnings",
                     "--edge-skip-compat-layer-relaunch",
                     "--allow-pre-commit-input"
-                ]
-            )
+                    ]
+                )
             
             # 验证浏览器已启动
             if not self.browser or not self.browser.is_connected():
