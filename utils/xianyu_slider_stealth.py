@@ -4363,12 +4363,37 @@ class XianyuSliderStealth:
             if any(keyword in page_content for keyword in ["验证码", "captcha", "滑块", "slider"]):
                 logger.info(f"【{self.pure_user_id}】页面内容包含验证码相关关键词")
                 
-                # 本地有头模式优先由用户手动完成验证，避免自动轨迹反复触发风控。
+                # 本地有头模式先复用原项目的自动滑块逻辑；失败后再把同一条
+                # 验证链接交给用户当前使用的 Chrome，保留人工兜底能力。
                 if self.headless:
                     success = self.solve_slider()
                 else:
-                    self._open_in_existing_chrome(url)
-                    success = self.wait_for_manual_verification()
+                    auto_slider_enabled = os.getenv(
+                        "XIANYU_AUTO_SLIDER_FIRST", "1"
+                    ) != "0"
+                    if auto_slider_enabled:
+                        try:
+                            auto_retries = max(
+                                1,
+                                int(os.getenv("XIANYU_AUTO_SLIDER_RETRIES", "3")),
+                            )
+                        except ValueError:
+                            auto_retries = 3
+
+                        logger.info(
+                            f"【{self.pure_user_id}】使用系统 Chrome 执行原自动滑块逻辑，"
+                            f"最多尝试 {auto_retries} 次"
+                        )
+                        success = self.solve_slider(max_retries=auto_retries)
+                    else:
+                        success = False
+
+                    if not success:
+                        logger.warning(
+                            f"【{self.pure_user_id}】自动滑块未通过，切换到当前 Chrome 人工验证"
+                        )
+                        self._open_in_existing_chrome(url)
+                        success = self.wait_for_manual_verification()
                 
                 if success:
                     logger.info(f"【{self.pure_user_id}】滑块验证成功")
