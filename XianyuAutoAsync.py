@@ -467,6 +467,10 @@ class XianyuLive:
 
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
+        # 风控期间不做秒级重连，给人工验证和服务端冷却留出时间。
+        if getattr(self, "risk_control_active", False):
+            return getattr(self, "risk_control_retry_delay", 300)
+
         # WebSocket意外断开 - 短延迟
         if "no close frame received or sent" in error_msg:
             return min(3 * self.connection_failures, 15)
@@ -737,6 +741,13 @@ class XianyuLive:
         # 滑块验证相关
         self.captcha_verification_count = 0  # 滑块验证次数计数器
         self.max_captcha_verification_count = 3  # 最大滑块验证次数，防止无限递归
+        self.risk_control_active = False
+        try:
+            self.risk_control_retry_delay = max(
+                60, int(os.getenv("XIANYU_RISK_RETRY_DELAY", "300"))
+            )
+        except ValueError:
+            self.risk_control_retry_delay = 300
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
@@ -2005,6 +2016,7 @@ class XianyuLive:
 
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
+                                self.risk_control_active = False
                                 logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
 
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
@@ -2014,6 +2026,7 @@ class XianyuLive:
 
                     # 检查是否需要滑块验证
                     if self._need_captcha_verification(res_json):
+                        self.risk_control_active = True
                         logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
 
                         # 记录滑块验证检测到日志文件
@@ -2254,12 +2267,19 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
+                # 本地桌面运行时尊重账号的“显示浏览器”设置，便于人工接管风控验证。
+                from app.db_manager import db_manager
+                account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+                show_browser = bool(account_info.get("show_browser", False))
+                browser_mode = "有头人工" if show_browser else "无头自动"
+                logger.info(f"【{self.cookie_id}】滑块验证模式: {browser_mode}")
+
                 # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
                 slider_stealth = XianyuSliderStealth(
                     # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用无头模式
+                    headless=not show_browser
                 )
 
                 # 在线程池中执行滑块验证
@@ -2276,6 +2296,7 @@ class XianyuLive:
                     )
 
                 if success and cookies:
+                    self.risk_control_active = False
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
 
                     # 只提取x5sec相关的cookie值进行更新

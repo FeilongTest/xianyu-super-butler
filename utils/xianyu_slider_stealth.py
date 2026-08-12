@@ -2161,7 +2161,7 @@ class XianyuSliderStealth:
             
             if found_failure:
                 logger.info(f"【{self.pure_user_id}】检测到验证失败关键词，验证失败")
-                return True
+                return True, None
             
             # 检查各种可能的验证失败提示元素
             failure_selectors = [
@@ -4333,8 +4333,11 @@ class XianyuSliderStealth:
             if any(keyword in page_content for keyword in ["验证码", "captcha", "滑块", "slider"]):
                 logger.info(f"【{self.pure_user_id}】页面内容包含验证码相关关键词")
                 
-                # 处理滑块验证
-                success = self.solve_slider()
+                # 本地有头模式优先由用户手动完成验证，避免自动轨迹反复触发风控。
+                if self.headless:
+                    success = self.solve_slider()
+                else:
+                    success = self.wait_for_manual_verification()
                 
                 if success:
                     logger.info(f"【{self.pure_user_id}】滑块验证成功")
@@ -4371,6 +4374,75 @@ class XianyuSliderStealth:
         finally:
             # 关闭浏览器
             self.close_browser()
+
+    def wait_for_manual_verification(self, timeout: int = None) -> bool:
+        """在有头浏览器中等待用户手动完成滑块验证。"""
+        if timeout is None:
+            try:
+                timeout = int(os.getenv("XIANYU_MANUAL_CAPTCHA_TIMEOUT", "300"))
+            except ValueError:
+                timeout = 300
+
+        timeout = max(30, timeout)
+        deadline = time.time() + timeout
+        challenge_seen = False
+        last_notice = 0
+        logger.warning(
+            f"【{self.pure_user_id}】已打开可见验证窗口，请在 {timeout} 秒内手动完成滑块"
+        )
+
+        while time.time() < deadline:
+            try:
+                if not self.page or self.page.is_closed():
+                    logger.warning(f"【{self.pure_user_id}】验证窗口已被关闭")
+                    return False
+
+                current_url = self.page.url or ""
+                current_title = self.page.title() or ""
+                cookies = self.context.cookies() if self.context else []
+                has_x5_cookie = any(
+                    "x5sec" in str(cookie.get("name", "")).lower() and cookie.get("value")
+                    for cookie in cookies
+                )
+
+                challenge_visible = False
+                for frame in self.page.frames:
+                    try:
+                        container = frame.query_selector(".nc-container")
+                        if container and container.is_visible():
+                            challenge_visible = True
+                            challenge_seen = True
+                            break
+                    except Exception:
+                        continue
+
+                url_left_challenge = (
+                    "action=captcha" not in current_url.lower()
+                    and "/punish" not in current_url.lower()
+                )
+                title_left_challenge = not any(
+                    keyword in current_title.lower()
+                    for keyword in ("captcha", "验证", "拦截")
+                )
+
+                if has_x5_cookie or url_left_challenge or (
+                    challenge_seen and not challenge_visible and title_left_challenge
+                ):
+                    logger.success(f"【{self.pure_user_id}】检测到手动滑块验证已完成")
+                    return True
+
+                now = time.time()
+                if now - last_notice >= 30:
+                    remaining = max(0, int(deadline - now))
+                    logger.info(f"【{self.pure_user_id}】等待手动验证，剩余 {remaining} 秒")
+                    last_notice = now
+            except Exception as exc:
+                logger.debug(f"【{self.pure_user_id}】检查手动验证状态失败: {exc}")
+
+            time.sleep(1)
+
+        logger.warning(f"【{self.pure_user_id}】等待手动滑块验证超时")
+        return False
 
 def get_slider_stats():
     """获取滑块验证并发统计信息"""
