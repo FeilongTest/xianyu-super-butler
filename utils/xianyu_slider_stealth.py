@@ -13,6 +13,7 @@ import math
 import threading
 import tempfile
 import platform
+import subprocess
 import shutil
 from datetime import datetime
 from playwright.sync_api import sync_playwright, ElementHandle
@@ -4366,6 +4367,7 @@ class XianyuSliderStealth:
                 if self.headless:
                     success = self.solve_slider()
                 else:
+                    self._open_in_existing_chrome(url)
                     success = self.wait_for_manual_verification()
                 
                 if success:
@@ -4404,6 +4406,31 @@ class XianyuSliderStealth:
             # 关闭浏览器
             self.close_browser()
 
+    def _open_in_existing_chrome(self, url: str) -> bool:
+        """在用户日常使用的 Chrome 中打开验证链接，Playwright 窗口只负责回收结果。"""
+        self.external_chrome_opened = False
+        if (
+            platform.system() != "Darwin"
+            or os.getenv("XIANYU_OPEN_IN_EXISTING_CHROME", "1") == "0"
+        ):
+            return False
+
+        try:
+            subprocess.Popen(
+                ["/usr/bin/open", "-a", "Google Chrome", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.external_chrome_opened = True
+            logger.warning(
+                f"【{self.pure_user_id}】验证链接已在当前使用的 Google Chrome 中打开，"
+                "请在该窗口完成滑块；自动化窗口无需操作"
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"【{self.pure_user_id}】无法在当前 Chrome 打开验证链接: {exc}")
+            return False
+
     def wait_for_manual_verification(self, timeout: int = None) -> bool:
         """在有头浏览器中等待用户手动完成滑块验证。"""
         if timeout is None:
@@ -4416,6 +4443,7 @@ class XianyuSliderStealth:
         deadline = time.time() + timeout
         challenge_seen = False
         last_notice = 0
+        last_external_check = 0
         logger.warning(
             f"【{self.pure_user_id}】已打开可见验证窗口，请在 {timeout} 秒内手动完成滑块"
         )
@@ -4428,12 +4456,6 @@ class XianyuSliderStealth:
 
                 current_url = self.page.url or ""
                 current_title = self.page.title() or ""
-                cookies = self.context.cookies() if self.context else []
-                has_x5_cookie = any(
-                    "x5sec" in str(cookie.get("name", "")).lower() and cookie.get("value")
-                    for cookie in cookies
-                )
-
                 challenge_visible = False
                 for frame in self.page.frames:
                     try:
@@ -4454,13 +4476,25 @@ class XianyuSliderStealth:
                     for keyword in ("captcha", "验证", "拦截")
                 )
 
-                if has_x5_cookie or url_left_challenge or (
+                if url_left_challenge or (
                     challenge_seen and not challenge_visible and title_left_challenge
                 ):
                     logger.success(f"【{self.pure_user_id}】检测到手动滑块验证已完成")
                     return True
 
                 now = time.time()
+                # 用户在日常 Chrome 完成验证后，重新加载自动化窗口以领取新的
+                # x5sec Cookie；整个过程不读取用户 Chrome 的任何数据。
+                if (
+                    getattr(self, "external_chrome_opened", False)
+                    and now - last_external_check >= 5
+                ):
+                    last_external_check = now
+                    try:
+                        self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                    except Exception as exc:
+                        logger.debug(f"【{self.pure_user_id}】检查外部 Chrome 验证结果失败: {exc}")
+
                 if now - last_notice >= 30:
                     remaining = max(0, int(deadline - now))
                     logger.info(f"【{self.pure_user_id}】等待手动验证，剩余 {remaining} 秒")
