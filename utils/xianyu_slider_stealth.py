@@ -245,7 +245,13 @@ strategy_stats = RetryStrategyStats()
 
 class XianyuSliderStealth:
     
-    def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True):
+    def __init__(
+        self,
+        user_id: str = "default",
+        enable_learning: bool = True,
+        headless: bool = True,
+        initial_cookies: Optional[Dict[str, str]] = None,
+    ):
         self.user_id = user_id
         self.enable_learning = enable_learning
         self.headless = headless  # 是否使用无头模式（默认True，使用无头模式）
@@ -253,6 +259,7 @@ class XianyuSliderStealth:
         self.page = None
         self.context = None
         self.playwright = None
+        self.initial_cookies = dict(initial_cookies or {})
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -448,6 +455,26 @@ class XianyuSliderStealth:
             if not self.context:
                 raise Exception("浏览器上下文创建失败")
             logger.info(f"【{self.pure_user_id}】浏览器上下文创建成功")
+
+            # 临时验证窗口保持独立，但注入后台账号Cookie，避免它表现成
+            # 一个完全未登录的浏览器。
+            if self.initial_cookies:
+                cookie_rows = [
+                    {
+                        "name": str(name),
+                        "value": str(value),
+                        "domain": ".goofish.com",
+                        "path": "/",
+                    }
+                    for name, value in self.initial_cookies.items()
+                    if value is not None
+                ]
+                if cookie_rows:
+                    self.context.add_cookies(cookie_rows)
+                    logger.info(
+                        f"【{self.pure_user_id}】已向临时验证窗口注入 "
+                        f"{len(cookie_rows)} 个账号Cookie"
+                    )
             
             # 创建新页面
             logger.info(f"【{self.pure_user_id}】创建新页面...")
@@ -4447,6 +4474,7 @@ class XianyuSliderStealth:
                 stderr=subprocess.DEVNULL,
             )
             self.external_chrome_opened = True
+            self.external_verification_url = url
             logger.warning(
                 f"【{self.pure_user_id}】验证链接已在当前使用的 Google Chrome 中打开，"
                 "请在该窗口完成滑块；自动化窗口无需操作"
@@ -4476,8 +4504,19 @@ class XianyuSliderStealth:
         while time.time() < deadline:
             try:
                 if not self.page or self.page.is_closed():
-                    logger.warning(f"【{self.pure_user_id}】验证窗口已被关闭")
-                    return False
+                    if getattr(self, "external_chrome_opened", False) and self.context:
+                        logger.info(
+                            f"【{self.pure_user_id}】自动验证页已关闭，创建探测页等待当前Chrome结果"
+                        )
+                        self.page = self.context.new_page()
+                        self.page.goto(
+                            self.external_verification_url,
+                            wait_until="domcontentloaded",
+                            timeout=15000,
+                        )
+                    else:
+                        logger.warning(f"【{self.pure_user_id}】验证窗口已被关闭")
+                        return False
 
                 current_url = self.page.url or ""
                 current_title = self.page.title() or ""
@@ -4516,7 +4555,11 @@ class XianyuSliderStealth:
                 ):
                     last_external_check = now
                     try:
-                        self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                        self.page.goto(
+                            self.external_verification_url,
+                            wait_until="domcontentloaded",
+                            timeout=15000,
+                        )
                     except Exception as exc:
                         logger.debug(f"【{self.pure_user_id}】检查外部 Chrome 验证结果失败: {exc}")
 

@@ -712,8 +712,15 @@ class XianyuLive:
 
         # Cookie刷新定时任务
         self.cookie_refresh_task = None
-        self.cookie_refresh_interval = 1200  # 1小时 = 3600秒
-        self.last_cookie_refresh_time = 0
+        # 启动时Token刷新已经会校验账号；本地常驻模式无需每20分钟再启动
+        # 一个临时浏览器。默认每6小时维护一次，减少异常登录和风控触发。
+        try:
+            self.cookie_refresh_interval = max(
+                3600, int(os.getenv("XIANYU_COOKIE_REFRESH_INTERVAL", "21600"))
+            )
+        except ValueError:
+            self.cookie_refresh_interval = 21600
+        self.last_cookie_refresh_time = time.time()
         self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
         self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能
 
@@ -2279,7 +2286,8 @@ class XianyuLive:
                     # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=not show_browser
+                    headless=not show_browser,
+                    initial_cookies=self.cookies,
                 )
 
                 # 在线程池中执行滑块验证
