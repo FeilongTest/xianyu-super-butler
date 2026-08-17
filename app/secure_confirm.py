@@ -7,6 +7,7 @@ import asyncio
 import json
 import time
 import aiohttp
+from contextlib import asynccontextmanager
 from loguru import logger
 from utils.xianyu_utils import generate_sign, trans_cookies
 
@@ -83,6 +84,37 @@ class SecureConfirm:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
 
+    @asynccontextmanager
+    async def _request_session(self):
+        """在当前事件循环中提供可用的 HTTP session。
+
+        账号运行时和 FastAPI 分别使用独立事件循环。手动完整发货
+        可能从 FastAPI 循环调用账号实例，此时不能复用账号循环创建的
+        aiohttp.ClientSession，否则 aiohttp 会报 timeout context 不在 task 中。
+        """
+        if not self.session:
+            raise RuntimeError("Session未创建")
+
+        current_loop = asyncio.get_running_loop()
+        session_loop = getattr(self.session, "_loop", current_loop)
+        session_closed = bool(getattr(self.session, "closed", False))
+
+        if not session_closed and session_loop is current_loop:
+            yield self.session
+            return
+
+        headers = dict(getattr(self.session, "headers", {}) or {})
+        headers["cookie"] = self.cookies_str
+        logger.warning(
+            f"【{self.cookie_id}】HTTP Session不属于当前事件循环，"
+            "本次确认发货使用独立Session"
+        )
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as temporary_session:
+            yield temporary_session
+
 
     async def auto_confirm(self, order_id, item_id=None, retry_count=0):
         """自动确认发货 - 使用真实商品ID刷新token"""
@@ -131,41 +163,42 @@ class SecureConfirm:
 
         try:
             logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
-                params=params,
-                data=data
-            ) as response:
-                res_json = await response.json()
+            async with self._request_session() as request_session:
+                async with request_session.post(
+                    'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
+                    params=params,
+                    data=data
+                ) as response:
+                    res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
+                    # 检查并更新Cookie
+                    if 'set-cookie' in response.headers:
+                        new_cookies = {}
+                        for cookie in response.headers.getall('set-cookie', []):
+                            if '=' in cookie:
+                                name, value = cookie.split(';')[0].split('=', 1)
+                                new_cookies[name.strip()] = value.strip()
 
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self._update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
+                        # 更新cookies
+                        if new_cookies:
+                            self.cookies.update(new_cookies)
+                            # 生成新的cookie字符串
+                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                            # 更新数据库中的Cookie
+                            await self._update_config_cookies()
+                            logger.debug("已更新Cookie到数据库")
 
-                logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
+                    logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
 
-                # 检查响应结果
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
-                    return {"success": True, "order_id": order_id}
-                else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+                    # 检查响应结果
+                    if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                        logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
+                        return {"success": True, "order_id": order_id}
+                    else:
+                        error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
+                        logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
 
-                    return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                        return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 
         except Exception as e:
