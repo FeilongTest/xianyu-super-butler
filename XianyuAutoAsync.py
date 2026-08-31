@@ -1398,20 +1398,61 @@ class XianyuLive:
             return None
 
     @staticmethod
+    def _extract_order_event_detail(message: dict) -> dict:
+        """兼容两种交易事件结构，返回 reminderContent 所在的详情对象。"""
+        if not isinstance(message, dict):
+            return {}
+
+        message_1 = message.get("1")
+        if isinstance(message_1, dict):
+            message_detail = message_1.get("10")
+            if isinstance(message_detail, dict):
+                return message_detail
+
+        # 新版推送会把会话、详情和时间平铺在顶层的 2/4/5 字段中，
+        # 此时 message["1"] 只是形如 "xxx.PNM" 的消息标识。
+        message_detail = message.get("4")
+        return message_detail if isinstance(message_detail, dict) else {}
+
+    @staticmethod
+    def _extract_order_event_context(message: dict) -> dict:
+        """从嵌套或平铺交易事件中提取买家、商品、会话和时间。"""
+        if not isinstance(message, dict):
+            return {}
+
+        message_1 = message.get("1")
+        nested = message_1 if isinstance(message_1, dict) else {}
+        detail = XianyuLive._extract_order_event_detail(message)
+        reminder_url = str(detail.get("reminderUrl") or "")
+        item_match = re.search(r"(?:[?&]|^)itemId=([^&]+)", reminder_url)
+        peer_match = re.search(r"(?:[?&]|^)peerUserId=([^&]+)", reminder_url)
+
+        chat_id_raw = nested.get("2") or message.get("2") or ""
+        chat_id = str(chat_id_raw).split("@")[0] if chat_id_raw else ""
+        create_time = nested.get("5") or message.get("5")
+        return {
+            "detail": detail,
+            # fix 项目优先采用 reminderUrl.peerUserId；它是交易会话的明确对端，
+            # senderUserId 在部分系统卡片中可能是系统/卖家侧标识。
+            "buyer_id": str((peer_match.group(1) if peer_match else None) or detail.get("senderUserId") or "") or None,
+            "buyer_name": detail.get("senderNick") or detail.get("reminderTitle") or "未知用户",
+            "item_id": item_match.group(1) if item_match else None,
+            "chat_id": chat_id,
+            "create_time": create_time,
+        }
+
+    @staticmethod
     def _extract_order_event_status(message: dict) -> str:
         """从交易卡片中识别可安全落库的订单状态。"""
         if not isinstance(message, dict):
             return None
 
         message_1 = message.get("1")
-        if not isinstance(message_1, dict):
-            return None
-
-        message_detail = message_1.get("10")
-        event_text = message_detail.get("reminderContent", "") if isinstance(message_detail, dict) else ""
-        red_reminder = message_detail.get("redReminder", "") if isinstance(message_detail, dict) else ""
+        message_detail = XianyuLive._extract_order_event_detail(message)
+        event_text = message_detail.get("reminderContent", "")
+        red_reminder = message_detail.get("redReminder", "")
         if not event_text:
-            content = message_1.get("6")
+            content = message_1.get("6") if isinstance(message_1, dict) else None
             content_detail = content.get("3") if isinstance(content, dict) else None
             event_text = content_detail.get("2", "") if isinstance(content_detail, dict) else ""
 
@@ -1424,6 +1465,10 @@ class XianyuLive:
         return {
             "[我已拍下，待付款]": "processing",
             "[我已付款，等待你发货]": "pending_ship",
+            # 新版交易卡片有时只发送催发货文案，但卡片同时携带明确的
+            # orderId/去发货按钮。这与“已付款，待发货”是同一状态，
+            # 如果不落库会继续沿用拍下时的 processing 缓存并跳过发货。
+            "[记得及时发货]": "pending_ship",
             "[买家已付款]": "pending_ship",
             "[付款完成]": "pending_ship",
             "[已付款，待发货]": "pending_ship",
@@ -1443,10 +1488,7 @@ class XianyuLive:
         """判断是否为卖家已经完成评价的系统回执。"""
         if not isinstance(message, dict):
             return False
-        message_1 = message.get("1")
-        message_detail = message_1.get("10") if isinstance(message_1, dict) else None
-        if not isinstance(message_detail, dict):
-            return False
+        message_detail = XianyuLive._extract_order_event_detail(message)
         return str(message_detail.get("reminderContent") or "").strip() == "[我完成了评价]"
 
     async def _auto_rate_completed_order(self, order_id: str) -> None:
@@ -1484,13 +1526,11 @@ class XianyuLive:
         try:
             from app.db_manager import db_manager
 
-            message_1 = message.get("1") if isinstance(message, dict) else None
-            message_1 = message_1 if isinstance(message_1, dict) else {}
-            chat_id_raw = message_1.get("2", "")
-            chat_id = str(chat_id_raw).split("@")[0] if chat_id_raw else ""
+            event_context = self._extract_order_event_context(message)
+            chat_id = event_context.get("chat_id") or ""
 
             created_at = None
-            create_time = message_1.get("5")
+            create_time = event_context.get("create_time")
             if create_time:
                 try:
                     created_at = time.strftime(
@@ -5332,9 +5372,23 @@ class XianyuLive:
 
                             # 先保存订单基本信息（包含时间和收货人信息）。空字符串和 unknown
                             # 不覆盖交易卡片已经识别出的有效时间与状态。
+                            persisted_item_id = item_id
+                            if existing_order and existing_order.get('item_id') and item_id:
+                                existing_item_id = str(existing_order.get('item_id'))
+                                incoming_item_id = str(item_id)
+                                if existing_item_id != incoming_item_id:
+                                    existing_item = db_manager.get_item_info(self.cookie_id, existing_item_id)
+                                    incoming_item = db_manager.get_item_info(self.cookie_id, incoming_item_id)
+                                    if existing_item and not incoming_item:
+                                        logger.warning(
+                                            f"【{self.cookie_id}】忽略订单消息中的临时卡片ID: "
+                                            f"{order_id}, {incoming_item_id}，保留商品 {existing_item_id}"
+                                        )
+                                        persisted_item_id = None
+
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
-                                item_id=item_id,
+                                item_id=persisted_item_id,
                                 buyer_id=buyer_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
@@ -8891,25 +8945,29 @@ class XianyuLive:
                         temp_user_id = None
                         temp_item_id = None
 
+                        event_context = self._extract_order_event_context(message)
+
                         # 提取用户ID
                         try:
+                            temp_user_id = event_context.get("buyer_id")
                             message_1 = message.get("1")
-                            if isinstance(message_1, str) and '@' in message_1:
+                            if not temp_user_id and isinstance(message_1, str) and '@' in message_1:
                                 temp_user_id = message_1.split('@')[0]
-                            elif isinstance(message_1, dict):
+                            elif not temp_user_id and isinstance(message_1, dict):
                                 # 从字典中提取用户ID
                                 if "10" in message_1 and isinstance(message_1["10"], dict):
                                     temp_user_id = message_1["10"].get("senderUserId", "unknown_user")
                                 else:
                                     temp_user_id = "unknown_user"
-                            else:
+                            if not temp_user_id:
                                 temp_user_id = "unknown_user"
                         except:
                             temp_user_id = "unknown_user"
 
                         # 提取商品ID
                         try:
-                            if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                            temp_item_id = event_context.get("item_id")
+                            if not temp_item_id and "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
                                 url_info = message["1"]["10"].get("reminderUrl", "")
                                 if isinstance(url_info, str) and "itemId=" in url_info:
                                     temp_item_id = url_info.split("itemId=")[1].split("&")[0]
@@ -8961,16 +9019,18 @@ class XianyuLive:
             # 安全地获取用户ID
             user_id = None
             try:
+                event_context = self._extract_order_event_context(message)
+                user_id = event_context.get("buyer_id")
                 message_1 = message.get("1")
-                if isinstance(message_1, str) and '@' in message_1:
+                if not user_id and isinstance(message_1, str) and '@' in message_1:
                     user_id = message_1.split('@')[0]
-                elif isinstance(message_1, dict):
+                elif not user_id and isinstance(message_1, dict):
                     # 如果message['1']是字典，从message["1"]["10"]["senderUserId"]中提取user_id
                     if "10" in message_1 and isinstance(message_1["10"], dict):
                         user_id = message_1["10"].get("senderUserId", "unknown_user")
                     else:
                         user_id = "unknown_user"
-                else:
+                if not user_id:
                     user_id = "unknown_user"
             except Exception as e:
                 logger.warning(f"提取用户ID失败: {self._safe_str(e)}")
@@ -8981,7 +9041,8 @@ class XianyuLive:
             # 安全地提取商品ID
             item_id = None
             try:
-                if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                item_id = event_context.get("item_id")
+                if not item_id and "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
                     url_info = message["1"]["10"].get("reminderUrl", "")
                     if isinstance(url_info, str) and "itemId=" in url_info:
                         item_id = url_info.split("itemId=")[1].split("&")[0]
@@ -9022,8 +9083,35 @@ class XianyuLive:
             except:
                 pass
 
+            # 新版交易推送可能是平铺结构：详情位于 message["4"]，不是普通聊天
+            # 消息，但付款事件仍必须进入自动发货链路。
+            is_chat_message = self.is_chat_message(message)
+            order_event_status = self._extract_order_event_status(message)
+            event_detail = event_context.get("detail") or {}
+            event_text = str(event_detail.get("reminderContent") or "").strip()
+            if not is_chat_message and order_event_status == "pending_ship" and self._is_auto_delivery_trigger(event_text):
+                create_time = event_context.get("create_time")
+                try:
+                    event_msg_time = time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(int(create_time) / 1000),
+                    ) if create_time else msg_time
+                except (TypeError, ValueError, OSError):
+                    event_msg_time = msg_time
+                logger.info(f'[{event_msg_time}] 【{self.cookie_id}】检测到平铺付款事件，进入订单校验')
+                await self._handle_auto_delivery(
+                    websocket,
+                    message,
+                    event_context.get("buyer_name") or "未知用户",
+                    event_context.get("buyer_id") or user_id,
+                    event_context.get("item_id") or item_id,
+                    event_context.get("chat_id") or "",
+                    event_msg_time,
+                )
+                return
+
             # 判断是否为聊天消息
-            if not self.is_chat_message(message):
+            if not is_chat_message:
                 logger.warning("非聊天消息")
                 return
 

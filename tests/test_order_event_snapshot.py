@@ -19,6 +19,60 @@ class OrderEventSnapshotTests(unittest.TestCase):
             "pending_ship",
         )
 
+    def test_delivery_reminder_marks_order_pending_ship(self):
+        message = {
+            "1": {
+                "10": {
+                    "reminderContent": "[记得及时发货]",
+                    "redReminder": "等待卖家发货",
+                },
+            },
+        }
+
+        self.assertEqual(
+            XianyuLive._extract_order_event_status(message),
+            "pending_ship",
+        )
+
+    def test_flattened_paid_event_extracts_status_and_context(self):
+        message = {
+            "1": "4274724498753.PNM",
+            "2": "66007031665@goofish",
+            "4": {
+                "reminderContent": "[已付款，待发货]",
+                "reminderUrl": (
+                    "fleamarket://message_chat?itemId=1069825745099"
+                    "&peerUserId=2207390817379&sid=66007031665"
+                ),
+                "senderUserId": "2207390817379",
+                "senderNick": "买家",
+            },
+            "5": 1788191496000,
+        }
+
+        self.assertEqual(XianyuLive._extract_order_event_status(message), "pending_ship")
+        context = XianyuLive._extract_order_event_context(message)
+        self.assertEqual(context["buyer_id"], "2207390817379")
+        self.assertEqual(context["item_id"], "1069825745099")
+        self.assertEqual(context["chat_id"], "66007031665")
+        self.assertEqual(context["create_time"], 1788191496000)
+
+    def test_peer_user_id_has_priority_over_sender_user_id(self):
+        message = {
+            "1": "4274724498753.PNM",
+            "2": "66007031665@goofish",
+            "4": {
+                "senderUserId": "system-or-self",
+                "reminderUrl": (
+                    "fleamarket://message_chat?itemId=1069825745099"
+                    "&peerUserId=2207390817379"
+                ),
+            },
+        }
+
+        context = XianyuLive._extract_order_event_context(message)
+        self.assertEqual(context["buyer_id"], "2207390817379")
+
     def test_new_rating_prompt_marks_order_completed(self):
         message = {
             "1": {
@@ -123,6 +177,39 @@ class OrderEventSnapshotTests(unittest.TestCase):
             created_at=None,
             chat_id="chat-1",
         )
+
+    def test_saves_flattened_paid_event_snapshot(self):
+        fake_db = Mock()
+        fake_db.get_item_info.return_value = {"item_price": "7.99"}
+        fake_db.get_order_by_id.return_value = None
+        fake_db.insert_or_update_order.return_value = True
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "seller"
+        message = {
+            "1": "4274724498753.PNM",
+            "2": "66007031665@goofish",
+            "4": {
+                "reminderContent": "[已付款，待发货]",
+                "reminderUrl": "fleamarket://message_chat?itemId=1069825745099",
+                "senderUserId": "2207390817379",
+            },
+            "5": 1788191496000,
+        }
+
+        with patch("app.db_manager.db_manager", fake_db):
+            saved = live._save_order_event_snapshot(
+                order_id="3316391978143007163",
+                message=message,
+                item_id="1069825745099",
+                buyer_id="2207390817379",
+            )
+
+        self.assertTrue(saved)
+        call = fake_db.insert_or_update_order.call_args.kwargs
+        self.assertEqual(call["order_status"], "pending_ship")
+        self.assertEqual(call["chat_id"], "66007031665")
+        self.assertEqual(call["item_id"], "1069825745099")
+        self.assertEqual(call["buyer_id"], "2207390817379")
 
     def test_ignores_non_transaction_messages(self):
         live = XianyuLive.__new__(XianyuLive)

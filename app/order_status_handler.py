@@ -77,6 +77,52 @@ class OrderStatusHandler:
         # 设置日志级别
         log_level = self.config.get('log_level', 'info')
         logger.info(f"订单状态处理器初始化完成，配置: {self.config}")
+
+    @staticmethod
+    def _extract_pending_match_context(message: dict) -> Dict[str, Any]:
+        """提取待处理消息的严格关联键，避免账号级 FIFO 串单。"""
+        if not isinstance(message, dict):
+            return {}
+        message_1 = message.get('1')
+        nested = message_1 if isinstance(message_1, dict) else {}
+        detail = nested.get('10') if isinstance(nested.get('10'), dict) else message.get('4')
+        detail = detail if isinstance(detail, dict) else {}
+        reminder_url = str(detail.get('reminderUrl') or '')
+
+        sid_raw = nested.get('2') or message.get('2') or (
+            message_1 if isinstance(message_1, str) and '@' in message_1 else ''
+        )
+        sid = str(sid_raw).split('@')[0] if sid_raw else None
+        item_match = re.search(r'(?:[?&]|^)itemId=([^&]+)', reminder_url)
+        peer_match = re.search(r'(?:[?&]|^)peerUserId=([^&]+)', reminder_url)
+        buyer_id = (peer_match.group(1) if peer_match else None) or detail.get('senderUserId')
+        return {
+            'message_hash': hash(str(sorted(message.items()))),
+            'sid': str(sid) if sid else None,
+            'buyer_id': str(buyer_id) if buyer_id else None,
+            'item_id': item_match.group(1) if item_match else None,
+        }
+
+    @classmethod
+    def _pending_message_matches_context(cls, pending_msg: Dict[str, Any], message: dict) -> bool:
+        """只接受消息哈希或 sid+buyer_id+item_id 三元组的精确匹配。"""
+        current = cls._extract_pending_match_context(message)
+        if pending_msg.get('message_hash') == current.get('message_hash'):
+            return True
+        try:
+            # 三元组关联只用于同一批、相邻到达的拆分事件；过旧消息即便买家和
+            # 商品相同，也可能属于该会话的上一张订单。
+            if time.time() - float(pending_msg.get('timestamp') or 0) > 300:
+                return False
+        except (TypeError, ValueError):
+            return False
+        fields = ('sid', 'buyer_id', 'item_id')
+        return all(
+            pending_msg.get(field)
+            and current.get(field)
+            and str(pending_msg[field]) == str(current[field])
+            for field in fields
+        )
     
     def extract_order_id(self, message: dict) -> Optional[str]:
         """从消息中提取订单ID"""
@@ -708,6 +754,7 @@ class OrderStatusHandler:
                 '你已发货': 'shipped',  # 已发货（无方括号）
                 '[你已发货，请等待买家确认收货]': 'shipped',  # 已发货（完整格式）
                 '[我已付款，等待你发货]': 'pending_ship',  # 已付款，等待发货
+                '[记得及时发货]': 'pending_ship',  # 新版催发货卡片同样表示已付款待发货
                 '[我已拍下，待付款]': 'processing',  # 已拍下，待付款
                 '[买家已付款]': 'pending_ship',  # 买家已付款
                 '[付款完成]': 'pending_ship',  # 付款完成
@@ -748,6 +795,7 @@ class OrderStatusHandler:
                 if cookie_id not in self._pending_system_messages:
                     self._pending_system_messages[cookie_id] = []
                 
+                pending_match_context = self._extract_pending_match_context(message)
                 self._pending_system_messages[cookie_id].append({
                     'message': message,
                     'send_message': send_message,
@@ -756,6 +804,9 @@ class OrderStatusHandler:
                     'new_status': new_status,
                     'temp_order_id': temp_order_id,
                     'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
+                    'sid': pending_match_context.get('sid'),
+                    'buyer_id': pending_match_context.get('buyer_id'),
+                    'item_id': pending_match_context.get('item_id'),
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
 
@@ -851,6 +902,7 @@ class OrderStatusHandler:
                 if cookie_id not in self._pending_red_reminder_messages:
                     self._pending_red_reminder_messages[cookie_id] = []
                 
+                pending_match_context = self._extract_pending_match_context(message)
                 self._pending_red_reminder_messages[cookie_id].append({
                     'message': message,
                     'red_reminder': red_reminder,
@@ -860,6 +912,9 @@ class OrderStatusHandler:
                     'new_status': 'cancelled',
                     'temp_order_id': temp_order_id,
                     'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
+                    'sid': pending_match_context.get('sid'),
+                    'buyer_id': pending_match_context.get('buyer_id'),
+                    'item_id': pending_match_context.get('item_id'),
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
 
@@ -1024,20 +1079,19 @@ class OrderStatusHandler:
                 
                 # 如果提供了消息，尝试匹配
                 if message:
-                    logger.info(f"🔍 尝试通过消息哈希匹配待处理的系统消息")
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
+                    logger.info(f"🔍 尝试通过严格关联键匹配待处理的系统消息")
                     # 从后往前遍历，避免pop时索引变化问题
                     for i in range(len(self._pending_system_messages[cookie_id]) - 1, -1, -1):
                         msg = self._pending_system_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
+                        if self._pending_message_matches_context(msg, message):
                             pending_msg = self._pending_system_messages[cookie_id].pop(i)
                             logger.info(f"✅ 通过消息哈希匹配到待处理的系统消息: {pending_msg['send_message']}")
                             break
                 
-                # 如果没有匹配到，使用FIFO原则
+                # 禁止账号级 FIFO 猜测关联。只有消息哈希或
+                # sid+buyer_id+item_id 三元组精确一致时才绑定。
                 if not pending_msg and self._pending_system_messages[cookie_id]:
-                    pending_msg = self._pending_system_messages[cookie_id].pop(0)
-                    logger.info(f"✅ 使用FIFO原则处理待处理的系统消息: {pending_msg['send_message']}")
+                    logger.info("ℹ️ 待处理系统消息与当前订单不匹配，保留至过期清理")
                 
                 if pending_msg:
                     logger.info(f"🔄 开始处理待处理的系统消息: {pending_msg['send_message']}")
@@ -1077,19 +1131,17 @@ class OrderStatusHandler:
                 
                 # 如果提供了消息，尝试匹配
                 if message:
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
                     # 从后往前遍历，避免pop时索引变化问题
                     for i in range(len(self._pending_red_reminder_messages[cookie_id]) - 1, -1, -1):
                         msg = self._pending_red_reminder_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
+                        if self._pending_message_matches_context(msg, message):
                             pending_msg = self._pending_red_reminder_messages[cookie_id].pop(i)
                             logger.info(f"通过消息哈希匹配到待处理的红色提醒消息: {pending_msg['red_reminder']}")
                             break
                 
-                # 如果没有匹配到，使用FIFO原则
+                # 红色提醒同样只能精确关联，不能跨会话按 FIFO 套用。
                 if not pending_msg and self._pending_red_reminder_messages[cookie_id]:
-                    pending_msg = self._pending_red_reminder_messages[cookie_id].pop(0)
-                    logger.info(f"使用FIFO原则处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
+                    logger.info("待处理红色提醒与当前订单不匹配，保留至过期清理")
                 
                 if pending_msg:
                     logger.info(f"检测到订单 {order_id} ID已提取，开始处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
