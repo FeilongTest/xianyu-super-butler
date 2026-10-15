@@ -37,7 +37,7 @@ COPY --from=frontend-builder /frontend/dist ./static
 FROM base AS runtime
 
 LABEL maintainer="23Star" \
-      version="2.5.0" \
+      version="3.0.0-beta" \
       description="Xianyu account, item, order, reply, and delivery management" \
       repository="https://github.com/23Star/xianyu-super-butler" \
       author="23Star"
@@ -50,7 +50,11 @@ RUN apt-get update && \
         fonts-dejavu-core \
         fonts-liberation \
         libgl1 \
-        libglib2.0-0 && \
+        libglib2.0-0 \
+        xvfb \
+        x11-utils \
+        nodejs \
+        npm && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv

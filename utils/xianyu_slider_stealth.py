@@ -9,6 +9,7 @@ import time
 import random
 import json
 import os
+import re
 import math
 import threading
 import tempfile
@@ -16,22 +17,155 @@ import platform
 import subprocess
 import shutil
 from datetime import datetime
+from pathlib import Path
 from playwright.sync_api import sync_playwright, ElementHandle
-from typing import Optional, Tuple, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable
 from loguru import logger
-from collections import defaultdict
+
+from utils import browser_limit
+from utils.user_agents import CHROME_UA
+
+# 滑块优先用 Patchright —— Playwright 的反检测分支，修掉了 CDP 层面的自动化痕迹。
+# 实测同一份 Chromium：Playwright 下 navigator.webdriver 为 true（最基础也最致命的
+# 自动化标志），Patchright 下为 false。API 与 Playwright 完全兼容，装不上就回退。
+try:
+    from patchright.sync_api import sync_playwright as patchright_sync_playwright
+    PATCHRIGHT_AVAILABLE = True
+except ImportError:
+    patchright_sync_playwright = None
+    PATCHRIGHT_AVAILABLE = False
 
 # 导入配置
 try:
     from app.config import SLIDER_VERIFICATION
-    SLIDER_MAX_CONCURRENT = SLIDER_VERIFICATION.get('max_concurrent', 3)
+    SLIDER_MAX_CONCURRENT = SLIDER_VERIFICATION.get('max_concurrent', 1)
     SLIDER_WAIT_TIMEOUT = SLIDER_VERIFICATION.get('wait_timeout', 60)
 except ImportError:
     # 如果无法导入配置，使用默认值
-    SLIDER_MAX_CONCURRENT = 3
+    SLIDER_MAX_CONCURRENT = 1
     SLIDER_WAIT_TIMEOUT = 60
 
 # 使用loguru日志库，与主程序保持一致
+
+
+def find_chromium_executable() -> Optional[str]:
+    """找出已安装的 Chromium 可执行文件路径。
+
+    Patchright 与 Playwright 各自绑定不同的 Chromium revision，让 Patchright 自己
+    去下载会平白多出几百 MB 且国内经常拉不动。这里把现成的那份显式指给它，
+    既省体积也省一次下载失败的排查。
+    """
+    roots: List[Path] = []
+    env_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+    if env_path:
+        # 显式指定了就只认这里 —— 与 Playwright 自身的语义一致。继续翻别的目录
+        # 可能挑到版本不匹配的浏览器，反而更难排查。
+        roots.append(Path(env_path))
+    else:
+        roots.append(Path('/ms-playwright'))                       # 容器镜像内的默认位置
+        roots.append(Path.home() / '.cache' / 'ms-playwright')      # Linux
+        roots.append(Path.home() / 'Library' / 'Caches' / 'ms-playwright')  # macOS
+
+    # 只认完整版 Chromium：headless shell 缺少滑块页面需要的渲染能力
+    candidates = (
+        'chrome-linux/chrome',
+        'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+        'chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+        'chrome-win/chrome.exe',
+    )
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            for browser_dir in sorted(root.glob('chromium-*'), reverse=True):
+                for suffix in candidates:
+                    executable = browser_dir / suffix
+                    if executable.exists():
+                        return str(executable)
+        except Exception:
+            continue
+    return None
+
+
+# 单次滑块流程的整体上限（秒）。正常一轮在 10-40 秒内结束，3 次重试也够用；
+# 超过说明卡在了没有超时保护的 CDP 调用上，此时宁可强制收尾也不能一直占着槽位。
+SLIDER_RUN_TIMEOUT = float(os.getenv('SLIDER_RUN_TIMEOUT', '180'))
+
+# 阿里 nc 滑块自己给出的失败文案。必须是完整短语：只写「重试」「失败」这类单字词，
+# 会把闲鱼页面本身的「哎哟喂，被挤爆啦，请稍后重试」和页面 JS 里的任意提示一起命中，
+# 从而把正在处理中的验证误判为失败。
+SLIDER_FAILURE_KEYWORDS = (
+    "验证失败",
+    "点击框体重试",
+    "滑动验证失败",
+    "验证码错误",
+    "哎呀，出错了",
+    "换一换",
+)
+
+# punish 页 URL 的特征片段。取回凭证前若 URL 仍命中其中任一项，说明服务端没有
+# 把我们放行走，页面上的 x5* 只是挑战态残留，不能当成通行凭证。
+PUNISH_URL_MARKERS = (
+    "punish",
+    "x5step=2",
+    "action=captcha",
+    "pureCaptcha",
+)
+
+
+def replay_trajectory(trajectory, start_x, start_y, move, sleep=time.sleep):
+    """按轨迹设计的时间轴回放拖动，返回 (终点x, 终点y, 统计信息)。
+
+    拖动的时间轴必须由代码控制，不能被机器性能决定。
+
+    ``move`` 通常是 ``page.mouse.move``，每次调用是一次同步 CDP 往返：高配机
+    1-3ms，低配机或 CPU 被占满时可能到 20-80ms。原实现「move 完再 sleep(delay)」，
+    每步实际间隔是「往返耗时 + delay」，只控制住了后一半 —— 设计 2.5-4 秒的甩动
+    在低配机上被摊成 8-15 秒，最小急动度的钟形速度包络被拉成锯齿。阿里滑块判的
+    正是采样点的时间序列，落点误差再小也会被判成机器，这就是「同样的代码，配置
+    低的机器过不去」。
+
+    这里改为 deadline 驱动：每步补齐到预定时间点。若某步开销已经超出预算（这台
+    机器跑不动当前采样率），就丢弃后续采样点来追回时间轴，而不是让整条轨迹越拖
+    越长。丢点等价于降低采样率（真实鼠标本就有 125/500/1000Hz 之分），速度曲线
+    的形状保持不变，远比拉长时间安全。
+    """
+    drag_clock = time.monotonic()
+    planned_elapsed = 0.0   # 轨迹设计到当前点为止应经过的时间
+    peak_lag = 0.0          # 最大滞后，用于事后判断机器是否吃得消
+
+    total_points = len(trajectory)
+
+    current_x, current_y = start_x, start_y
+    index = 0
+    while index < total_points:
+        x, y, delay = trajectory[index]
+        current_x = start_x + x
+        current_y = start_y + y
+
+        move(current_x, current_y)
+        index += 1
+
+        # 按轨迹设计的间隔走就够了。
+        #
+        # 这里曾经有一套「deadline 补偿」：落后于设计时间轴时丢弃后续采样点来
+        # 追赶。但它的追赶循环每次只把 planned_elapsed 加一个点的 delay（约 12ms），
+        # 而落后量常常是几秒，且 index 一到保护段就停 —— 永远追不上，
+        # 于是每一步都在做无效的追赶计算，实测把 1.15 秒的拖动拖成 175 秒，
+        # 滑块必然判失败。实测直接回放只需 1.1 秒，补偿纯属帮倒忙。
+        elapsed = time.monotonic() - drag_clock
+        planned_elapsed += delay
+        if planned_elapsed > elapsed:
+            sleep(planned_elapsed - elapsed)
+        else:
+            peak_lag = max(peak_lag, elapsed - planned_elapsed)
+
+    return current_x, current_y, {
+        "total_points": total_points,
+        "planned_elapsed": planned_elapsed,
+        "peak_lag": peak_lag,
+    }
+
 
 # 全局并发控制
 class SliderConcurrencyManager:
@@ -260,6 +394,8 @@ class XianyuSliderStealth:
         self.context = None
         self.playwright = None
         self.initial_cookies = dict(initial_cookies or {})
+        self._browser_slot_held = False  # 是否占用着全局浏览器槽位
+        self._stealth_engine = 'patchright' if PATCHRIGHT_AVAILABLE else 'playwright'
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -288,22 +424,25 @@ class XianyuSliderStealth:
         
         self.success_history_file = f"trajectory_history/{self.pure_user_id}_success.json"
         self.trajectory_params = {
-            "total_steps_range": [15, 25],  # 适中步数（平衡速度和真实度）
-            "base_delay_range": [0.003, 0.008],  # 适中延迟：3-8ms（更接近人类操作）
-            "jitter_x_range": [0, 2],  # 小幅抖动
-            "jitter_y_range": [0, 2],  # 小幅抖动
-            "slow_factor_range": [8, 12],  # 适中加速因子
-            "acceleration_phase": 1.0,  # 全程加速
-            "fast_phase": 1.0,  # 无慢速
-            "slow_start_ratio_base": 2.0,  # 确保超调100%
+            "total_steps_range": [70, 95],  # 采样点数：快速甩动约 70-95 点，仍在真人量级
+            "base_delay_range": [0.007, 0.012],  # 每步 7-12ms，对齐真实鼠标 80-140Hz 采样率
+            "jitter_x_range": [-1, 1],  # X 轴微颤，需双向，单向偏移是机器特征
+            "jitter_y_range": [-3, 3],  # Y 轴漂移，人手无法保持水平
+            "slow_factor_range": [8, 12],  # 保留字段，供学习态回写
+            "acceleration_phase": 0.1,  # 起步加速占比
+            "fast_phase": 0.75,  # 匀速段占比，其后进入减速逼近
+            "slow_start_ratio_base": 1.0,  # 落点即目标，超调另由 overshoot 控制
             "completion_usage_rate": 0.05,  # 极少补全使用率
             "avg_completion_steps": 1.0,  # 极少补全步数
             "trajectory_length_stats": [],
-            "learning_enabled": False
+            "learning_enabled": True
         }
         
         # 保存最后一次使用的轨迹参数（用于分析优化）
         self.last_trajectory_params = {}
+
+        # 当前验证页地址，重试时需要重新导航以获得全新滑块
+        self._current_url = None
     
     def _check_date_validity(self) -> bool:
         """检查日期有效性 - 已禁用
@@ -316,141 +455,128 @@ class XianyuSliderStealth:
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         try:
-            # 启动 Playwright
-            logger.info(f"【{self.pure_user_id}】启动Playwright...")
-            self.playwright = sync_playwright().start()
-            logger.info(f"【{self.pure_user_id}】Playwright启动成功")
+            # 占用一个浏览器槽位，close_browser 时归还。
+            # 多账号同时触发滑块时，弱 CPU 机器上并发拉起 Chrome 会互相拖慢，
+            # 反而更容易验证失败。
+            if not self._browser_slot_held:
+                browser_limit.acquire_slot("滑块验证")
+                self._browser_slot_held = True
+
+            # 启动 Playwright。优先 Patchright：同一份 Chromium 下它能把
+            # navigator.webdriver 从 true 变成 false，少掉一个最容易被查的标志。
+            if PATCHRIGHT_AVAILABLE:
+                self.playwright = patchright_sync_playwright().start()
+                self._stealth_engine = 'patchright'
+                logger.info(f"【{self.pure_user_id}】Patchright 启动成功（反检测内核）")
+            else:
+                logger.info(f"【{self.pure_user_id}】启动Playwright...")
+                self.playwright = sync_playwright().start()
+                self._stealth_engine = 'playwright'
+                logger.info(f"【{self.pure_user_id}】Playwright启动成功")
             
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
             
-            # 本地人工验证优先使用系统安装的正式版 Chrome。Chrome for Testing
-            # 带有明显的自动化启动特征，闲鱼滑块经常会直接拒绝人工拖动。
-            system_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            use_system_chrome = (
-                not self.headless
-                and platform.system() == "Darwin"
-                and os.path.exists(system_chrome)
-                and os.getenv("XIANYU_USE_SYSTEM_CHROME", "1") != "0"
-            )
+            # 启动浏览器，使用随机特征
+            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
 
-            if use_system_chrome:
-                logger.info(
-                    f"【{self.pure_user_id}】启动系统 Google Chrome 人工验证窗口"
-                )
-                self.browser = self.playwright.chromium.launch(
-                    executable_path=system_chrome,
-                    headless=False,
-                    ignore_default_args=["--enable-automation"],
-                    args=[
-                        "--start-maximized",
-                        f"--window-size={browser_features['window_size']}",
-                        f"--lang={browser_features['lang']}",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-            else:
-                # 无头自动模式保留原有兼容参数。
-                logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
-                self.browser = self.playwright.chromium.launch(
-                    headless=self.headless,
-                    args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-zygote",
-                    "--disable-gpu",
-                    "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor",
-                    "--start-maximized",  # 窗口最大化
-                    f"--window-size={browser_features['window_size']}",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
-                    f"--lang={browser_features['lang']}",
-                    f"--accept-lang={browser_features['accept_lang']}",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-extensions",
-                    "--disable-plugins",
-                    "--disable-default-apps",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--hide-scrollbars",
-                    "--mute-audio",
-                    "--no-default-browser-check",
-                    "--disable-logging",
-                    "--disable-permissions-api",
-                    "--disable-notifications",
-                    "--disable-popup-blocking",
-                    "--disable-prompt-on-repost",
-                    "--disable-hang-monitor",
-                    "--disable-client-side-phishing-detection",
-                    "--disable-component-extensions-with-background-pages",
-                    "--disable-background-mode",
-                    "--disable-domain-reliability",
-                    "--disable-features=TranslateUI",
-                    "--disable-ipc-flooding-protection",
-                    "--disable-field-trial-config",
-                    "--disable-background-networking",
-                    "--disable-back-forward-cache",
-                    "--disable-breakpad",
-                    "--disable-component-update",
-                    "--force-color-profile=srgb",
-                    "--metrics-recording-only",
-                    "--password-store=basic",
-                    "--use-mock-keychain",
-                    "--no-service-autorun",
-                    "--export-tagged-pdf",
-                    "--disable-search-engine-choice-screen",
-                    "--unsafely-disable-devtools-self-xss-warnings",
-                    "--edge-skip-compat-layer-relaunch",
-                    "--allow-pre-commit-input"
-                    ]
-                )
-            
-            # 验证浏览器已启动
-            if not self.browser or not self.browser.is_connected():
-                raise Exception("浏览器启动失败或连接已断开")
-            logger.info(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
-            
-            # 创建上下文，使用随机特征
-            logger.info(f"【{self.pure_user_id}】创建浏览器上下文...")
-            
-            # 🔑 关键优化：添加更多真实浏览器特征
+            # 实测结论：Playwright 自带的 Chromium（Chrome for Testing）指纹会被阿里 nc
+            # 识破，连真人手动拖动都判定失败；换成系统正式版 Chrome + 持久化用户目录后
+            # 同样的手动拖动即可通过。因此这里必须走 channel='chrome' 的持久化上下文，
+            # 让 CDP 之外的指纹（二进制版本、插件、WebGL、历史 profile）都保持真实。
+            user_data_dir = os.path.join(
+                os.getcwd(), 'browser_data', f'slider_{self.pure_user_id}'
+            )
+            os.makedirs(user_data_dir, exist_ok=True)
+            self._clean_singleton_lock_files(user_data_dir)
+
+            launch_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--start-maximized",
+                f"--window-size={browser_features['window_size']}",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                f"--lang={browser_features['lang']}",
+                "--disable-blink-features=AutomationControlled",
+                "--no-default-browser-check",
+                "--disable-popup-blocking",
+                "--disable-search-engine-choice-screen",
+                "--password-store=basic",
+                "--use-mock-keychain",
+            ]
+
+            # 持久化上下文没有独立的 browser 对象，context 即入口
             context_options = {
-                'user_agent': browser_features['user_agent'],
                 'locale': browser_features['locale'],
                 'timezone_id': browser_features['timezone_id'],
-                # 🔑 添加真实的权限设置
-                'permissions': ['geolocation', 'notifications'],
-                # 🔑 添加真实的色彩方案
                 'color_scheme': random.choice(['light', 'dark', 'no-preference']),
-                # 🔑 添加HTTP凭据
-                'http_credentials': None,
-                # 🔑 忽略HTTPS错误（某些情况下更真实）
                 'ignore_https_errors': False,
             }
-            
-            # 根据模式配置viewport和no_viewport
             if not self.headless:
-                # 有头模式：使用 no_viewport=True 支持窗口最大化
-                # 注意：使用no_viewport时，不能设置device_scale_factor、is_mobile、has_touch
-                context_options['no_viewport'] = True  # 移除viewport限制，支持--start-maximized
-                self.context = self.browser.new_context(**context_options)
+                context_options['no_viewport'] = True
             else:
-                # 无头模式：使用固定viewport
-                context_options.update({
-                    'viewport': {'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                    'device_scale_factor': browser_features['device_scale_factor'],
-                    'is_mobile': browser_features['is_mobile'],
-                    'has_touch': browser_features['has_touch'],
-                })
-                self.context = self.browser.new_context(**context_options)
-            
+                context_options['viewport'] = {
+                    'width': browser_features['viewport_width'],
+                    'height': browser_features['viewport_height'],
+                }
+
+            try:
+                self.context = self.playwright.chromium.launch_persistent_context(
+                    user_data_dir,
+                    channel='chrome',  # 系统安装的正式版 Chrome
+                    headless=self.headless,
+                    args=launch_args,
+                    **context_options,
+                )
+                self.browser = None  # 持久化模式下无独立 browser 句柄
+                logger.info(f"【{self.pure_user_id}】已启动系统 Chrome（持久化目录）")
+            except Exception as chrome_error:
+                # 容器里通常没有系统 Chrome，这条回退才是 Docker/NAS 的实际路径。
+                # 仍用持久化上下文：一次性 context 没有历史 profile，指纹更假。
+                # Patchright 在这里尤其重要 —— 它补上了 Chromium 相对正式版
+                # Chrome 缺失的那部分伪装。
+                logger.warning(
+                    f"【{self.pure_user_id}】系统 Chrome 不可用（{chrome_error}），"
+                    f"回退 Chromium（引擎: {getattr(self, '_stealth_engine', 'playwright')}）"
+                )
+                fallback_options = dict(context_options)
+                # user_agent 为 None 时不要传给 Playwright：传 None 会被当成
+                # 「显式覆盖为空」，反而抹掉 Chromium 的原生 UA。
+                if browser_features.get('user_agent'):
+                    fallback_options['user_agent'] = browser_features['user_agent']
+                executable_path = find_chromium_executable()
+                if executable_path:
+                    fallback_options['executable_path'] = executable_path
+                    logger.info(f"【{self.pure_user_id}】使用 Chromium: {executable_path}")
+                try:
+                    self.context = self.playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        headless=self.headless,
+                        args=launch_args,
+                        **fallback_options,
+                    )
+                    self.browser = None
+                except Exception as persistent_error:
+                    # 持久化目录被占用等情况下退到普通上下文，至少别让流程崩掉
+                    logger.warning(
+                        f"【{self.pure_user_id}】持久化上下文不可用（{persistent_error}），"
+                        "改用普通上下文"
+                    )
+                    launch_kwargs: Dict[str, Any] = {
+                        'headless': self.headless,
+                        'args': launch_args,
+                    }
+                    if executable_path:
+                        launch_kwargs['executable_path'] = executable_path
+                    self.browser = self.playwright.chromium.launch(**launch_kwargs)
+                    if browser_features.get('user_agent'):
+                        context_options['user_agent'] = browser_features['user_agent']
+                    self.context = self.browser.new_context(**context_options)
+
             # 验证上下文已创建
             if not self.context:
                 raise Exception("浏览器上下文创建失败")
@@ -478,7 +604,8 @@ class XianyuSliderStealth:
             
             # 创建新页面
             logger.info(f"【{self.pure_user_id}】创建新页面...")
-            self.page = self.context.new_page()
+            existing = self.context.pages
+            self.page = existing[0] if existing else self.context.new_page()
             
             # 验证页面已创建
             if not self.page:
@@ -528,6 +655,13 @@ class XianyuSliderStealth:
                 self.playwright = None
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理Playwright时出错: {e}")
+
+        # 归还槽位。init_browser 是先占槽再启动浏览器，启动失败时若只清理进程
+        # 不还槽位，就要等调用方记得调 close_browser 才归还 —— 只要有一条路径
+        # 忘了，这个全局唯一的槽位就永久漏掉。
+        if self._browser_slot_held:
+            self._browser_slot_held = False
+            browser_limit.release_slot("滑块验证")
     
     def _load_success_history(self) -> List[Dict[str, Any]]:
         """加载历史成功数据"""
@@ -641,18 +775,19 @@ class XianyuSliderStealth:
             
             # 优化参数 - 真实人类模式（优先真实度而非速度）
             # 计算步数范围（确保最小值 < 最大值）
-            steps_min = max(110, int(safe_avg(total_steps_list) - safe_std(total_steps_list) * 0.8))
-            steps_max = min(130, int(safe_avg(total_steps_list) + safe_std(total_steps_list) * 0.8))
+            steps_min = max(70, int(safe_avg(total_steps_list) - safe_std(total_steps_list) * 0.8))
+            steps_max = min(95, int(safe_avg(total_steps_list) + safe_std(total_steps_list) * 0.8))
             if steps_min >= steps_max:
-                steps_min = 115
-                steps_max = 125
+                steps_min = 75
+                steps_max = 90
             
             # 计算延迟范围（确保最小值 < 最大值）
-            delay_min = max(0.020, safe_avg(base_delay_list) - safe_std(base_delay_list) * 0.6)
+            # 下界与默认值保持一致，否则学习态会把实际成功的节奏又拉回慢档
+            delay_min = max(0.007, safe_avg(base_delay_list) - safe_std(base_delay_list) * 0.6)
             delay_max = min(0.030, safe_avg(base_delay_list) + safe_std(base_delay_list) * 0.6)
             if delay_min >= delay_max:
-                delay_min = 0.022
-                delay_max = 0.027
+                delay_min = 0.008
+                delay_max = 0.012
             
             # 计算慢速因子范围（确保最小值 < 最大值）
             slow_min = max(5, int(safe_avg(slow_factor_list) - safe_std(slow_factor_list)))
@@ -685,57 +820,78 @@ class XianyuSliderStealth:
             return self.trajectory_params
     
     def _get_cookies_after_success(self):
-        """滑块验证成功后获取cookie"""
+        """取回验证通过后的 x5 系列 Cookie，取不到有效凭证时返回 None。
+
+        两道关卡，缺一不可：
+
+        1. URL 还停在 punish 路径上，说明服务端根本没放行，此刻页面上的
+           cookie 只是挑战态残留。
+        2. 必须含 x5sec —— 它才是通行凭证。x5secdata / x5sectag / x5step 是我们
+           导航进 punish 页时自己带进去的挑战标记，永远存在；只要拿「有没有
+           x5* 」当成功判据，就等于无条件判成功，然后把一堆挑战 cookie 写回
+           账号，token 刷新永远返回 FAIL_SYS_USER_VALIDATE，形成死循环。
+        """
         try:
             logger.info(f"【{self.pure_user_id}】开始获取滑块验证成功后的页面cookie...")
-            
-            # 检查当前页面URL
-            current_url = self.page.url
+
+            current_url = ""
+            try:
+                current_url = self.page.url or ""
+            except Exception:
+                pass
             logger.info(f"【{self.pure_user_id}】当前页面URL: {current_url}")
-            
-            # 检查页面标题
-            page_title = self.page.title()
-            logger.info(f"【{self.pure_user_id}】当前页面标题: {page_title}")
-            
-            # 等待一下确保cookie完全更新
+
+            try:
+                logger.info(f"【{self.pure_user_id}】当前页面标题: {self.page.title()}")
+            except Exception:
+                pass
+
+            # 从 punish 跳走后留个窗口，让 set-cookie 落盘
             time.sleep(1)
-            
-            # 获取浏览器中的所有cookie
+
+            if any(k in current_url for k in PUNISH_URL_MARKERS):
+                logger.error(
+                    f"【{self.pure_user_id}】❌ 取 cookie 前发现 URL 仍在 punish，"
+                    f"验证未真正通过: {current_url[:120]}"
+                )
+                return None
+
             cookies = self.context.cookies()
-            
-            if cookies:
-                # 将cookie转换为字典格式
-                new_cookies = {}
-                for cookie in cookies:
-                    new_cookies[cookie['name']] = cookie['value']
-                
-                logger.info(f"【{self.pure_user_id}】滑块验证成功后已获取cookie，共{len(new_cookies)}个cookie")
-                
-                # 记录所有cookie的详细信息
-                logger.info(f"【{self.pure_user_id}】获取到的所有cookie: {list(new_cookies.keys())}")
-                
-                # 只提取x5sec相关的cookie
-                filtered_cookies = {}
-                
-                # 筛选出x5相关的cookies（包括x5sec, x5step等）
-                for cookie_name, cookie_value in new_cookies.items():
-                    cookie_name_lower = cookie_name.lower()
-                    if cookie_name_lower.startswith('x5') or 'x5sec' in cookie_name_lower:
-                        filtered_cookies[cookie_name] = cookie_value
-                        logger.info(f"【{self.pure_user_id}】x5相关cookie已获取: {cookie_name} = {cookie_value}")
-                
-                logger.info(f"【{self.pure_user_id}】找到{len(filtered_cookies)}个x5相关cookies: {list(filtered_cookies.keys())}")
-                
-                if filtered_cookies:
-                    logger.info(f"【{self.pure_user_id}】返回过滤后的x5相关cookie: {list(filtered_cookies.keys())}")
-                    return filtered_cookies
-                else:
-                    logger.warning(f"【{self.pure_user_id}】未找到x5相关cookie")
-                    return None
-            else:
+            if not cookies:
                 logger.warning(f"【{self.pure_user_id}】未获取到任何cookie")
                 return None
-                
+
+            new_cookies = {c['name']: c['value'] for c in cookies}
+            logger.info(
+                f"【{self.pure_user_id}】滑块验证成功后已获取cookie，"
+                f"共{len(new_cookies)}个cookie"
+            )
+            logger.info(f"【{self.pure_user_id}】获取到的所有cookie: {list(new_cookies.keys())}")
+
+            filtered_cookies = {}
+            for cookie_name, cookie_value in new_cookies.items():
+                if cookie_name.lower().startswith('x5'):
+                    filtered_cookies[cookie_name] = cookie_value
+
+            logger.info(
+                f"【{self.pure_user_id}】找到{len(filtered_cookies)}个x5相关cookies: "
+                f"{list(filtered_cookies.keys())}"
+            )
+
+            if 'x5sec' not in filtered_cookies:
+                logger.error(
+                    f"【{self.pure_user_id}】❌ x5 cookie 中没有 x5sec，"
+                    f"滑块视觉通过但服务端并未放行。已有key: "
+                    f"{list(filtered_cookies.keys())}"
+                )
+                return None
+
+            logger.info(
+                f"【{self.pure_user_id}】返回过滤后的x5相关cookie: "
+                f"{list(filtered_cookies.keys())}"
+            )
+            return filtered_cookies
+
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】获取滑块验证成功后的cookie失败: {str(e)}")
             return None
@@ -758,467 +914,76 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】保存cookie到文件失败: {str(e)}")
     
     def _get_random_browser_features(self):
-        """获取随机浏览器特征"""
-        # 随机选择窗口大小（使用更大的尺寸以适应最大化）
-        window_sizes = [
-            "1920,1080", "1920,1200", "2560,1440", "1680,1050", "1600,900"
-        ]
-        
-        # 随机选择语言
-        languages = [
-            ("zh-CN", "zh-CN,zh;q=0.9,en;q=0.8"),
-            ("zh-CN", "zh-CN,zh;q=0.9"),
-            ("zh-CN", "zh-CN,zh;q=0.8,en;q=0.6")
-        ]
-        
-        # 随机选择用户代理
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-        ]
-        
-        window_size = random.choice(window_sizes)
-        lang, accept_lang = random.choice(languages)
-        user_agent = random.choice(user_agents)
-        
-        # 解析窗口大小
-        width, height = map(int, window_size.split(','))
-        
+        """返回与启动上下文一致的稳定特征配置。
+
+        这里原本会随机挑窗口尺寸、缩放比和 UA —— 而 UA 池里同时混着
+        Windows 和 Mac，注入脚本又把 navigator.platform 写死 Win32，凑出的是
+        一组自相矛盾的指纹。更麻烦的是伪造 UA 只改 JS/请求头里的字符串，
+        Client Hints 和真实内核版本对不上，反而是明确的机器人特征。
+
+        所以 user_agent 现在返回 None：让 Chromium 报自己真实的 UA，与
+        Client Hints 天然一致。调用方需按 falsy 跳过覆盖。
+        """
         return {
-            'window_size': window_size,
-            'lang': lang,
-            'accept_lang': accept_lang,
-            'user_agent': user_agent,
-            'locale': lang,
-            'viewport_width': width,
-            'viewport_height': height,
-            'device_scale_factor': random.choice([1.0, 1.25, 1.5]),
+            'window_size': '1920,1080',
+            'lang': 'zh-CN',
+            'accept_lang': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'user_agent': None,
+            'locale': 'zh-CN',
+            'viewport_width': 1920,
+            'viewport_height': 1080,
+            'device_scale_factor': 1.0,
             'is_mobile': False,
             'has_touch': False,
             'timezone_id': 'Asia/Shanghai'
         }
     
     def _get_stealth_script(self, browser_features):
-        """获取增强反检测脚本"""
-        return f"""
-            // 隐藏webdriver属性
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined,
-            }});
-            
-            // 隐藏自动化相关属性
-            delete navigator.__proto__.webdriver;
-            delete window.navigator.webdriver;
-            delete window.navigator.__proto__.webdriver;
-            
-            // 模拟真实浏览器环境
-            window.chrome = {{
-                runtime: {{}},
-                loadTimes: function() {{}},
-                csi: function() {{}},
-                app: {{}}
-            }};
-            
-            // 覆盖plugins - 随机化
-            const pluginCount = {random.randint(3, 8)};
-            Object.defineProperty(navigator, 'plugins', {{
-                get: () => Array.from({{length: pluginCount}}, (_, i) => ({{
-                    name: 'Plugin' + i,
-                    description: 'Plugin ' + i
-                }})),
-            }});
-            
-            // 覆盖languages
-            Object.defineProperty(navigator, 'languages', {{
-                get: () => ['{browser_features['locale']}', 'zh', 'en'],
-            }});
-            
-            // 模拟真实的屏幕信息
-            Object.defineProperty(screen, 'availWidth', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'availHeight', {{ get: () => {browser_features['viewport_height'] - 40} }});
-            Object.defineProperty(screen, 'width', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'height', {{ get: () => {browser_features['viewport_height']} }});
-            
-            // 隐藏自动化检测 - 随机化硬件信息
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {random.choice([2, 4, 6, 8])} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {random.choice([4, 8, 16])} }});
-            
-            // 模拟真实的时区
-            Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {{
-                value: function() {{
-                    return {{ timeZone: '{browser_features['timezone_id']}' }};
-                }}
-            }});
-            
-            // 隐藏自动化痕迹
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-            
-            // 模拟有头模式的特征
-            Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => 0 }});
-            Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
-            Object.defineProperty(navigator, 'vendor', {{ get: () => 'Google Inc.' }});
-            Object.defineProperty(navigator, 'vendorSub', {{ get: () => '' }});
-            Object.defineProperty(navigator, 'productSub', {{ get: () => '20030107' }});
-            
-            // 模拟真实的连接信息
-            Object.defineProperty(navigator, 'connection', {{
-                get: () => ({{
-                    effectiveType: "{random.choice(['3g', '4g', '5g'])}",
-                    rtt: {random.randint(20, 100)},
-                    downlink: {round(random.uniform(1, 10), 2)}
-                }})
-            }});
-            
-            // 隐藏无头模式特征
-            Object.defineProperty(navigator, 'headless', {{ get: () => undefined }});
-            Object.defineProperty(window, 'outerHeight', {{ get: () => {browser_features['viewport_height']} }});
-            Object.defineProperty(window, 'outerWidth', {{ get: () => {browser_features['viewport_width']} }});
-            
-            // 模拟真实的媒体设备
-            Object.defineProperty(navigator, 'mediaDevices', {{
-                get: () => ({{
-                    enumerateDevices: () => Promise.resolve([])
-                }}),
-            }});
-            
-            // 隐藏自动化检测特征
-            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_fn', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_unwrapped', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__fxdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__driver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_func', {{ get: () => undefined }});
-            
-            // 隐藏Playwright特定的对象
-            delete window.playwright;
-            delete window.__playwright;
-            delete window.__pw_manual;
-            delete window.__pw_original;
-            
-            // 模拟真实的用户代理
-            Object.defineProperty(navigator, 'userAgent', {{
-                get: () => '{browser_features['user_agent']}'
-            }});
-            
-            // 隐藏自动化相关的全局变量
-            delete window.webdriver;
-            delete window.__webdriver_script_fn;
-            delete window.__webdriver_evaluate;
-            delete window.__webdriver_unwrapped;
-            delete window.__fxdriver_evaluate;
-            delete window.__driver_evaluate;
-            delete window.__webdriver_script_func;
-            delete window._selenium;
-            delete window._phantom;
-            delete window.callPhantom;
-            delete window._phantom;
-            delete window.phantom;
-            delete window.Buffer;
-            delete window.emit;
-            delete window.spawn;
-            
-            // Canvas指纹随机化
-            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function() {{
-                const context = this.getContext('2d');
-                if (context) {{
-                    const imageData = context.getImageData(0, 0, this.width, this.height);
-                    const data = imageData.data;
-                    for (let i = 0; i < data.length; i += 4) {{
-                        if (Math.random() < 0.001) {{
-                            data[i] = Math.floor(Math.random() * 256);
-                        }}
-                    }}
-                    context.putImageData(imageData, 0, 0);
-                }}
-                return originalToDataURL.apply(this, arguments);
-            }};
-            
-            // 音频指纹随机化
-            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-            AudioBuffer.prototype.getChannelData = function(channel) {{
-                const data = originalGetChannelData.call(this, channel);
-                for (let i = 0; i < data.length; i += 1000) {{
-                    if (Math.random() < 0.01) {{
-                        data[i] += Math.random() * 0.0001;
-                    }}
-                }}
-                return data;
-            }};
-            
-            // WebGL指纹随机化
-            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                if (parameter === 37445) {{ // UNMASKED_VENDOR_WEBGL
-                    return 'Intel Inc.';
-                }}
-                if (parameter === 37446) {{ // UNMASKED_RENDERER_WEBGL
-                    return 'Intel Iris OpenGL Engine';
-                }}
-                return originalGetParameter.call(this, parameter);
-            }};
-            
-            // 模拟真实的鼠标事件
-            const originalAddEventListener = EventTarget.prototype.addEventListener;
-            EventTarget.prototype.addEventListener = function(type, listener, options) {{
-                if (type === 'mousedown' || type === 'mouseup' || type === 'mousemove') {{
-                    const originalListener = listener;
-                    listener = function(event) {{
-                        setTimeout(() => originalListener.call(this, event), Math.random() * 10);
-                    }};
-                }}
-                return originalAddEventListener.call(this, type, listener, options);
-            }};
-            
-            // 随机化字体检测
-            Object.defineProperty(document, 'fonts', {{
-                get: () => ({{
-                    ready: Promise.resolve(),
-                    check: () => true,
-                    load: () => Promise.resolve([])
-                }})
-            }});
-            
-            // 隐藏自动化检测的常见特征
-            Object.defineProperty(window, 'chrome', {{
-                get: () => ({{
-                    runtime: {{}},
-                    loadTimes: function() {{}},
-                    csi: function() {{}},
-                    app: {{}}
-                }})
-            }});
-            
-            // 增强鼠标移动轨迹记录
-            let mouseMovements = [];
-            let lastMouseTime = Date.now();
-            document.addEventListener('mousemove', function(e) {{
-                const now = Date.now();
-                const timeDiff = now - lastMouseTime;
-                mouseMovements.push({{
-                    x: e.clientX,
-                    y: e.clientY,
-                    time: now,
-                    timeDiff: timeDiff
-                }});
-                lastMouseTime = now;
-                // 保持最近100个移动记录
-                if (mouseMovements.length > 100) {{
-                    mouseMovements.shift();
-                }}
-            }}, true);
-            
-            // 模拟真实的屏幕触摸点数
-            Object.defineProperty(navigator, 'maxTouchPoints', {{
-                get: () => {random.choice([0, 1, 5, 10])}
-            }});
-            
-            // 模拟真实的电池API
-            if (navigator.getBattery) {{
-                const originalGetBattery = navigator.getBattery;
-                navigator.getBattery = async function() {{
-                    const battery = await originalGetBattery.call(navigator);
-                    Object.defineProperty(battery, 'charging', {{ get: () => {random.choice(['true', 'false'])} }});
-                    Object.defineProperty(battery, 'level', {{ get: () => {random.uniform(0.3, 0.95):.2f} }});
-                    return battery;
-                }};
-            }}
-            
-            // 伪装鼠标移动加速度（反检测关键）
-            let velocityProfile = [];
-            window.addEventListener('mousemove', function(e) {{
-                const now = performance.now();
-                velocityProfile.push({{ x: e.clientX, y: e.clientY, t: now }});
-                if (velocityProfile.length > 50) velocityProfile.shift();
-            }}, true);
-            
-            // 伪装Permission API
-            const originalQuery = Permissions.prototype.query;
-            Permissions.prototype.query = function(parameters) {{
-                if (parameters.name === 'notifications') {{
-                    return Promise.resolve({{ state: 'denied' }});
-                }}
-                return originalQuery.apply(this, arguments);
-            }};
-            
-            // 伪装Performance API
-            const originalNow = Performance.prototype.now;
-            Performance.prototype.now = function() {{
-                return originalNow.call(this) + Math.random() * 0.1;
-            }};
-            
-            // 伪装Date API（添加微小随机偏移）
-            const OriginalDate = Date;
-            Date = function(...args) {{
-                if (args.length === 0) {{
-                    const date = new OriginalDate();
-                    const offset = Math.floor(Math.random() * 3) - 1; // -1到1毫秒
-                    return new OriginalDate(date.getTime() + offset);
-                }}
-                return new OriginalDate(...args);
-            }};
-            Date.prototype = OriginalDate.prototype;
-            Date.now = function() {{
-                return OriginalDate.now() + Math.floor(Math.random() * 3) - 1;
-            }};
-            
-            // 伪装RTCPeerConnection（WebRTC指纹）
-            if (window.RTCPeerConnection) {{
-                const originalRTC = window.RTCPeerConnection;
-                window.RTCPeerConnection = function(...args) {{
-                    const pc = new originalRTC(...args);
-                    const originalCreateOffer = pc.createOffer;
-                    pc.createOffer = function(...args) {{
-                        return originalCreateOffer.apply(this, args).then(offer => {{
-                            // 修改SDP指纹
-                            offer.sdp = offer.sdp.replace(/a=fingerprint:.*\\r\\n/g, 
-                                `a=fingerprint:sha-256 ${{Array.from({{length:64}}, ()=>Math.floor(Math.random()*16).toString(16)).join('')}}\\r\\n`);
-                            return offer;
-                        }});
-                    }};
-                    return pc;
-                }};
-            }}
-            
-            // 伪装 Notification 权限（防止被检测为自动化）
-            Object.defineProperty(Notification, 'permission', {{
-                get: function() {{
-                    return ['default', 'granted', 'denied'][Math.floor(Math.random() * 3)];
-                }}
-            }});
-            
-            // 伪装 Connection API（添加网络信息变化）
-            if (navigator.connection) {{
-                const connection = navigator.connection;
-                const originalEffectiveType = connection.effectiveType;
-                Object.defineProperty(connection, 'effectiveType', {{
-                    get: function() {{
-                        const types = ['slow-2g', '2g', '3g', '4g'];
-                        return types[Math.floor(Math.random() * types.length)];
-                    }}
-                }});
-                Object.defineProperty(connection, 'rtt', {{
-                    get: function() {{
-                        return Math.floor(Math.random() * 100) + 50; // 50-150ms
-                    }}
-                }});
-                Object.defineProperty(connection, 'downlink', {{
-                    get: function() {{
-                        return Math.random() * 10 + 1; // 1-11 Mbps
-                    }}
-                }});
-            }}
-            
-            // 伪装 DeviceMemory（设备内存）
-            Object.defineProperty(navigator, 'deviceMemory', {{
-                get: function() {{
-                    const memories = [2, 4, 8, 16];
-                    return memories[Math.floor(Math.random() * memories.length)];
-                }}
-            }});
-            
-            // 伪装 HardwareConcurrency（CPU核心数）
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{
-                get: function() {{
-                    const cores = [2, 4, 6, 8, 12, 16];
-                    return cores[Math.floor(Math.random() * cores.length)];
-                }}
-            }});
-            
-            // 伪装 maxTouchPoints（触摸点数量）
-            Object.defineProperty(navigator, 'maxTouchPoints', {{
-                get: function() {{
-                    return Math.floor(Math.random() * 5) + 1; // 1-5个触摸点
-                }}
-            }});
-            
-            // 伪装 DoNotTrack
-            Object.defineProperty(navigator, 'doNotTrack', {{
-                get: function() {{
-                    return ['1', '0', 'unspecified', null][Math.floor(Math.random() * 4)];
-                }}
-            }});
-            
-            // 伪装 Geolocation（添加微小延迟和误差）
-            if (navigator.geolocation) {{
-                const originalGetCurrentPosition = navigator.geolocation.getCurrentPosition;
-                navigator.geolocation.getCurrentPosition = function(success, error, options) {{
-                    const wrappedSuccess = function(position) {{
-                        // 添加微小的位置偏移（模拟真实GPS误差）
-                        const offset = Math.random() * 0.001;
-                        position.coords.latitude += offset;
-                        position.coords.longitude += offset;
-                        success(position);
-                    }};
-                    // 添加随机延迟
-                    setTimeout(() => {{
-                        originalGetCurrentPosition.call(this, wrappedSuccess, error, options);
-                    }}, Math.random() * 100);
-                }};
-            }}
-            
-            // 伪装 Clipboard API（防止检测剪贴板访问模式）
-            if (navigator.clipboard) {{
-                const originalReadText = navigator.clipboard.readText;
-                navigator.clipboard.readText = async function() {{
-                    // 添加微小延迟
-                    await new Promise(resolve => setTimeout(resolve, Math.random() * 50));
-                    return originalReadText.call(this);
-                }};
-            }}
-            
-            // 🔑 关键优化：隐藏CDP运行时特征
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined
-            }});
-            
-            // 🔑 隐藏自动化控制特征
-            window.navigator.chrome = {{
-                runtime: {{}},
-                loadTimes: function() {{}},
-                csi: function() {{}},
-                app: {{}}
-            }};
-            
-            // 🔑 隐藏Playwright特征
-            delete window.__playwright;
-            delete window.__pw_manual;
-            delete window.__PW_inspect;
-            
-            // 🔑 伪装chrome对象（防止检测headless）
-            if (!window.chrome) {{
-                window.chrome = {{}};
-            }}
-            window.chrome.runtime = {{
-                id: undefined,
-                sendMessage: function() {{}},
-                connect: function() {{}}
-            }};
-            
-            // 🔑 伪装Permissions API
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({{ state: Notification.permission }}) :
-                    originalQuery(parameters)
-            );
-            
-            // 🔑 覆盖Function.prototype.toString以隐藏代理
-            const oldToString = Function.prototype.toString;
-            Function.prototype.toString = function() {{
-                if (this === navigator.permissions.query) {{
-                    return 'function query() {{ [native code] }}';
-                }}
-                return oldToString.call(this);
-            }};
+        """最小化隐藏脚本：只抹掉明确的自动化标记，其余一律保留原生值。
+
+        这里曾经是一段 17.5KB 的「全家桶」伪装：改 UA、屏幕、插件、Canvas、
+        WebGL、AudioBuffer、Date、Performance，还把 mousemove 监听塞进
+        setTimeout。它有两个致命问题：
+
+        1. 顶层重复声明了 `const originalQuery`（伪装 Permissions API 的代码
+           被复制粘贴了两遍）。这是解析期 SyntaxError —— 整段脚本一行都没
+           执行过，navigator.webdriver 始终是 true。而 add_init_script 的
+           解析失败只会冒一个 pageerror，日志里看不见，于是「已添加反检测
+           脚本」的日志骗了我们很久。
+        2. 即使语法修好，它也跑不完：webdriver 和 maxTouchPoints 各被
+           Object.defineProperty 定义了两次，而默认 configurable 为 false，
+           第二次必然抛 TypeError 再次中断。
+
+        更根本的是方向错了：伪造 UA（还随机在 Windows/Mac 之间跳，同时把
+        navigator.platform 写死 Win32）、伪造屏幕和时间 API，产生的是一组
+        互相矛盾的指纹 —— 比只藏自动化标记更容易被风控识破。所以现在只做
+        两件确定有收益的事，并且每段独立 try/catch，一处失败不拖垮其余。
+
+        Args:
+            browser_features: 保留入参以兼容调用方，脚本本身不再使用。
+        Returns:
+            注入用的 JS 源码。
         """
-    
+        _ = browser_features
+        return """
+            try {
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true
+                });
+                delete Object.getPrototypeOf(navigator).webdriver;
+            } catch (e) {}
+            try {
+                delete window.playwright;
+                delete window.__playwright;
+                delete window.__pw_manual;
+                delete window.__PW_inspect;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+            } catch (e) {}
+        """
+
     def _bezier_curve(self, p0, p1, p2, p3, t):
         """三次贝塞尔曲线 - 生成更自然的轨迹"""
         return (1-t)**3 * p0 + 3*(1-t)**2*t * p1 + 3*(1-t)*t**2 * p2 + t**3 * p3
@@ -1237,65 +1002,119 @@ class XianyuSliderStealth:
             return t
     
     def _generate_physics_trajectory(self, distance: float):
-        """基于物理加速度模型生成轨迹 - 适中速度模式
+        """基于最小急动度模型生成轨迹 - 拟人模式
 
-        优化策略：
-        1. 适中轨迹点（15-25步）：平衡速度和真实度
-        2. 持续加速：一气呵成，不减速
-        3. 确保超调100%以上：保证滑动到位
-        4. 无回退：单向滑动
-        5. 适中延迟：3-8ms（更接近人类操作）
+        风控拦截的是行为特征而非落点精度，因此这里对齐人手的真实运动学：
+        1. 最小急动度曲线（10t³-15t⁴+6t⁵）：钟形速度包络，起步加速、末段减速
+        2. 百级采样点 + 20-30ms 步进：单次拖拽耗时 2.5-4 秒
+        3. 双向微颤 + Y 轴漂移：人手无法走出单向直线
+        4. 轻微超调后回拉修正：人眼确认到位需要一次微调
+        5. 随机迟疑：低概率插入额外停顿，破坏等间隔节奏
         """
         trajectory = []
-        # 确保超调100%
-        target_distance = distance * random.uniform(2.0, 2.1)  # 超调100-110%
+        params = self._optimize_trajectory_params()
 
-        # 适中步数（15-25步）
-        steps = random.randint(15, 25)
+        steps_range = params.get("total_steps_range", [110, 130])
+        delay_range = params.get("base_delay_range", [0.020, 0.030])
+        jitter_x_range = params.get("jitter_x_range", [-1, 1])
+        jitter_y_range = params.get("jitter_y_range", [-3, 3])
 
-        # 适中时间间隔（3-8ms）
-        base_delay = random.uniform(0.003, 0.008)
+        steps = random.randint(int(steps_range[0]), int(steps_range[1]))
+        base_delay = random.uniform(float(delay_range[0]), float(delay_range[1]))
 
-        # 生成轨迹点 - 直线加速
+        # 甩出量取轨道长度的 40%-85%：手感是"用力甩到底"而非"精确对准"
+        overshoot = random.uniform(distance * 0.4, distance * 0.85)
+        peak_distance = distance + overshoot
+
+        # Y 轴走非水平弧线：人手绕手腕转动，起落点不在同一高度，
+        # 且整条轨迹是斜的 —— 纯水平移动是机器特征。
+        drift_direction = random.choice([-1, 1])
+        arc_amplitude = random.uniform(6.0, 16.0)      # 弧线高度
+        tilt = drift_direction * random.uniform(4.0, 12.0)  # 整体倾斜，终点比起点高/低
+
+        # 主行程：最小急动度曲线
         for i in range(steps):
             progress = (i + 1) / steps
+            # 10t³-15t⁴+6t⁵，速度呈钟形，两端平滑
+            eased = 10 * progress ** 3 - 15 * progress ** 4 + 6 * progress ** 5
 
-            # 计算当前位置（使用平方加速曲线，越来越快）
-            x = target_distance * (progress ** 1.5)  # 加速曲线
+            x = peak_distance * eased + random.uniform(*jitter_x_range)
+            # 弧线 + 线性倾斜 + 高频微颤，三者叠加成非水平轨迹
+            y = (drift_direction * arc_amplitude * math.sin(progress * math.pi)
+                 + tilt * progress
+                 + random.uniform(*jitter_y_range) * 0.4)
 
-            # 小幅Y轴抖动
-            y = random.uniform(0, 2)
-
-            # 适中延迟
-            delay = base_delay * random.uniform(0.9, 1.1)
+            delay = base_delay * random.uniform(0.85, 1.15)
+            # 约 4% 概率出现迟疑，打破等间隔节奏
+            if random.random() < 0.04:
+                delay += random.uniform(0.02, 0.05)
 
             trajectory.append((x, y, delay))
 
-        logger.info(f"【{self.pure_user_id}】适中速度模式：{len(trajectory)}步，超调100%+")
+        # 回弹：手指松力后滑块被弹回一点，再小幅晃动稳定。
+        # 这是甩到底时的自然物理反应，与"精确回拉修正"完全不同。
+        rebound = random.uniform(6.0, 18.0)
+        rebound_steps = random.randint(3, 5)
+        last_y = trajectory[-1][1] if trajectory else 0.0
+        for i in range(rebound_steps):
+            progress = (i + 1) / rebound_steps
+            x = peak_distance - rebound * progress + random.uniform(-0.8, 0.8)
+            y = last_y + random.uniform(-1.5, 1.5)
+            trajectory.append((x, y, random.uniform(0.015, 0.035)))
+
+        # 稳定：回弹后小幅抖动，模拟手停住但仍有生理震颤
+        settle_x = peak_distance - rebound
+        for _ in range(random.randint(2, 3)):
+            trajectory.append((
+                settle_x + random.uniform(-1.2, 1.2),
+                last_y + random.uniform(-1.2, 1.2),
+                random.uniform(0.02, 0.045),
+            ))
+
+        self.last_trajectory_params = {
+            "base_delay": base_delay,
+            "jitter_x_range": jitter_x_range,
+            "jitter_y_range": jitter_y_range,
+            "overshoot": overshoot,
+            "correction_steps": rebound_steps,
+        }
+
+        logger.info(
+            f"【{self.pure_user_id}】拟人模式：{len(trajectory)}步，"
+            f"耗时{sum(p[2] for p in trajectory):.2f}秒，"
+            f"甩出{overshoot:.0f}px后回弹{rebound:.0f}px"
+        )
         return trajectory
     
     def generate_human_trajectory(self, distance: float):
-        """生成人类化滑动轨迹 - 只使用极速物理模型"""
+        """生成人类化滑动轨迹 - 最小急动度运动模型"""
         try:
-            # 只使用物理加速度模型（移除贝塞尔模型以提高速度和稳定性）
-            logger.info(f"【{self.pure_user_id}】📐 使用极速物理模型生成轨迹")
+            logger.info(f"【{self.pure_user_id}】📐 使用拟人运动模型生成轨迹")
             trajectory = self._generate_physics_trajectory(distance)
-            
-            logger.debug(f"【{self.pure_user_id}】极速模式：一次拖到位，无回退")
-            
-            # 保存轨迹数据
+
+            logger.debug(f"【{self.pure_user_id}】拟人模式：超调后回拉修正")
+
+            # 保存轨迹数据（字段需与 _save_success_record 对齐，否则学习态取不到值）
+            last_params = self.last_trajectory_params or {}
             self.current_trajectory_data = {
                 "distance": distance,
-                "model": "physics_fast",
+                "model": "physics_human",
                 "total_steps": len(trajectory),
                 "trajectory_points": trajectory.copy(),
+                "base_delay": last_params.get("base_delay", 0),
+                "jitter_x_range": last_params.get("jitter_x_range", [0, 0]),
+                "jitter_y_range": last_params.get("jitter_y_range", [0, 0]),
+                "slow_factor": self.trajectory_params.get("slow_factor_range", [0, 0])[0],
+                "acceleration_phase": self.trajectory_params.get("acceleration_phase", 0),
+                "fast_phase": self.trajectory_params.get("fast_phase", 0),
+                "slow_start_ratio": self.trajectory_params.get("slow_start_ratio_base", 0),
                 "final_left_px": 0,
                 "completion_used": False,
-                "completion_steps": 0
+                "completion_steps": last_params.get("correction_steps", 0)
             }
-            
+
             return trajectory
-            
+
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】生成轨迹时出错: {str(e)}")
             return []
@@ -1317,6 +1136,14 @@ class XianyuSliderStealth:
             start_x = button_box["x"] + button_box["width"] / 2
             start_y = button_box["y"] + button_box["height"] / 2
             logger.debug(f"【{self.pure_user_id}】滑块位置: ({start_x}, {start_y})")
+
+            # 滑块类型必须在按下鼠标【之前】判定完。这个检测内部要调
+            # page.content() 序列化整个 DOM，放在拖动过程中会阻塞住整条流程。
+            try:
+                is_scratch = self.is_scratch_captcha()
+            except Exception as exc:
+                logger.warning(f"【{self.pure_user_id}】判定滑块类型失败，按普通滑块处理: {exc}")
+                is_scratch = False
             
             # 第一阶段：移动到滑块附近（模拟人类寻找滑块）
             try:
@@ -1362,83 +1189,109 @@ class XianyuSliderStealth:
                 start_time = time.time()
                 current_x = start_x
                 current_y = start_y
-                
-                # 执行拖动轨迹
-                for i, (x, y, delay) in enumerate(trajectory):
-                    # 更新当前位置
-                    current_x = start_x + x
-                    current_y = start_y + y
-                    
-                    # 移动鼠标
-                    self.page.mouse.move(
-                        current_x,
-                        current_y,
-                        steps=random.randint(1, 3)
-                    )
-                    
-                    # 延迟（添加微小随机变化）
-                    actual_delay = delay * random.uniform(0.9, 1.1)
-                    time.sleep(actual_delay)
-                    
-                    # 记录最终位置
-                    if i == len(trajectory) - 1:
-                        try:
-                            current_style = slider_button.get_attribute("style")
-                            if current_style and "left:" in current_style:
-                                import re
-                                left_match = re.search(r'left:\s*([^;]+)', current_style)
-                                if left_match:
-                                    left_value = left_match.group(1).strip()
-                                    left_px = float(left_value.replace('px', ''))
-                                    if hasattr(self, 'current_trajectory_data'):
-                                        self.current_trajectory_data["final_left_px"] = left_px
-                                    logger.info(f"【{self.pure_user_id}】滑动完成: {len(trajectory)}步 - 最终位置: {left_value}")
-                        except:
-                            pass
-                
+
+                # 分段计时：整个流程曾经稳定卡满 180 秒看门狗，而抛出的异常总是
+                # 「Mouse.up: Target page ... closed」—— 那只是浏览器被强杀后的
+                # 表象，真正挂住的是哪一次 CDP 调用无从判断。这里给每段独立记时，
+                # 让日志直接点出阻塞点，不必再靠猜。
+                phase_marks = []
+
+                def mark(label, since):
+                    cost = time.time() - since
+                    phase_marks.append(f"{label}={cost:.2f}s")
+                    return time.time()
+
+                mark_at = start_time
+                current_x, current_y, stats = replay_trajectory(
+                    trajectory,
+                    start_x,
+                    start_y,
+                    # 轨迹本身已有 70-95 个密集采样点，相邻点间距仅几 px，
+                    # movementX 天然落在真人区间，无需再用 steps 细分 ——
+                    # steps=N 会产生 N 次独立 CDP 往返，把 1.3 秒的甩动拖成 4 秒。
+                    lambda x, y: self.page.mouse.move(x, y),
+                )
+                total_points = stats["total_points"]
+                mark_at = mark("回放", mark_at)
+
+                # 落点必须在【松手之前】读：松手后 nc 会把滑块归位，读到的
+                # left 恒为 0。之前把这段挪到 mouse.up() 之后，导致失败摘要里
+                # 永远是「最终位置0px」，还把 0 写进轨迹学习历史，让学习系统
+                # 以为每条轨迹都没能拖动滑块。
+                # 这里必须给超时：默认 30 秒，且元素可能已被 nc 摘掉。
+                try:
+                    current_style = slider_button.get_attribute("style", timeout=3000)
+                    if current_style and "left:" in current_style:
+                        left_match = re.search(r'left:\s*([^;]+)', current_style)
+                        if left_match:
+                            left_value = left_match.group(1).strip()
+                            if hasattr(self, 'current_trajectory_data'):
+                                self.current_trajectory_data["final_left_px"] = float(
+                                    left_value.replace('px', '')
+                                )
+                            logger.info(
+                                f"【{self.pure_user_id}】滑动落点: {total_points}步 - {left_value}"
+                            )
+                except Exception as exc:
+                    logger.debug(f"【{self.pure_user_id}】读取滑块落点失败（不影响验证）: {exc}")
+                mark_at = mark("读落点", mark_at)
+
                 # 🎨 刮刮乐特殊处理：在目标位置停顿观察
-                is_scratch = self.is_scratch_captcha()
+                # 注意用的是拖动【开始前】就取好的判定结果。这里绝不能再调
+                # is_scratch_captcha() —— 它内部是 page.content()，会序列化整个 DOM，
+                # 而此刻鼠标还按着、页面正在跑验证动画，该调用极易挂死，
+                # 导致流程卡在 mouse.up() 之前，直到看门狗强杀浏览器才抛
+                # 「Mouse.up: Target page, context or browser has been closed」。
                 if is_scratch:
                     pause_duration = random.uniform(0.3, 0.5)
                     logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：在目标位置停顿{pause_duration:.2f}秒观察...")
                     time.sleep(pause_duration)
-                
-                # 释放鼠标
-                time.sleep(random.uniform(0.02, 0.05))
+
+                # 释放前停顿：人手到位后会先确认再松开，立即释放是脚本特征
+                time.sleep(random.uniform(0.12, 0.28))
+                mark_at = mark("松手前停顿", mark_at)
                 self.page.mouse.up()
-                time.sleep(random.uniform(0.01, 0.03))
-                
-                # 触发click事件
-                try:
-                    slider_button.evaluate(f"""
-                        (slider) => {{
-                            const event = new MouseEvent('click', {{
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                                clientX: {current_x},
-                                clientY: {current_y},
-                                button: 0
-                            }});
-                            slider.dispatchEvent(event);
-                        }}
-                    """)
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】触发click事件失败（可忽略）: {e}")
-                
+                mark_at = mark("松手", mark_at)
+                time.sleep(random.uniform(0.05, 0.12))
+
+                # 注意：此处不再补发合成 click 事件。
+                # dispatchEvent 造出的事件 isTrusted 为 false，是风控的直接判定依据，
+                # 而 mouse.up() 本身已由 CDP 产生可信的原生事件序列。
+
                 elapsed_time = time.time() - start_time
-                logger.info(f"【{self.pure_user_id}】滑动完成: 耗时={elapsed_time:.2f}秒, 最终位置=({current_x:.1f}, {current_y:.1f})")
+                logger.info(
+                    f"【{self.pure_user_id}】滑动完成: 耗时={elapsed_time:.2f}秒"
+                    f"(轨迹设计{stats['planned_elapsed']:.2f}秒), "
+                    f"最终位置=({current_x:.1f}, {current_y:.1f})"
+                    f" | 分段: {', '.join(phase_marks)}"
+                )
+                # 丢点或滞后明显，说明这台机器发不出设计的采样率。时间轴已被
+                # 补偿，但仍要让用户看到 —— 「配置低的机器过不了滑块」的根因就在这。
+                if stats["peak_lag"] > 0.3:
+                    logger.warning(
+                        f"【{self.pure_user_id}】拖动比设计节奏慢了 "
+                        f"{stats['peak_lag'] * 1000:.0f}ms，滑块通过率会下降；"
+                        f"若持续如此，请降低同时运行的账号数或提高机器配置"
+                    )
+
                 
                 return True
                 
             except Exception as e:
-                logger.error(f"【{self.pure_user_id}】执行滑动轨迹失败: {e}")
+                # 分段耗时在异常路径上同样要打出来：挂死时抛出的总是
+                # 「Mouse.up: Target page ... closed」（浏览器被看门狗强杀后的
+                # 表象），只有分段数据能指出真正阻塞在哪一步。
+                logger.error(
+                    f"【{self.pure_user_id}】执行滑动轨迹失败: {e}"
+                    f" | 已完成分段: {', '.join(phase_marks) or '（无，卡在回放中）'}"
+                    f" | 距本阶段开始 {time.time() - start_time:.2f}秒"
+                )
                 import traceback
                 logger.error(traceback.format_exc())
                 # 确保释放鼠标
                 try:
                     self.page.mouse.up()
-                except:
+                except Exception:
                     pass
                 return False
             
@@ -1451,7 +1304,6 @@ class XianyuSliderStealth:
     def _simulate_human_page_behavior(self):
         """模拟人类在验证页面的前置行为 - 极速模式已禁用"""
         # 极速模式：不进行页面行为模拟，直接开始滑动
-        pass
     
     def find_slider_elements(self, fast_mode=False):
         """查找滑块元素（支持在主页面和所有frame中查找）
@@ -1553,7 +1405,11 @@ class XianyuSliderStealth:
                     logger.info(f"【{self.pure_user_id}】已知滑块在主页面，直接在主页面查找...")
                     for selector in container_selectors:
                         try:
-                            element = self.page.wait_for_selector(selector, timeout=1000)
+                            # 用 query_selector 立即返回。wait_for_selector 对不存在的
+                            # 元素会死等到超时，12 个候选选择器 × 1 秒 × 走两遍就是 24 秒，
+                            # 加上按钮和轨道查找，单轮要 53 秒 —— 这才是滑块流程的大头。
+                            # 页面此时已经加载完，元素要么在要么不在，没有等待的必要。
+                            element = self.page.query_selector(selector)
                             if element:
                                 logger.info(f"【{self.pure_user_id}】在已知主页面找到滑块容器: {selector}")
                                 slider_container = element
@@ -1567,7 +1423,7 @@ class XianyuSliderStealth:
             if not slider_container:
                 for selector in container_selectors:
                     try:
-                        element = self.page.wait_for_selector(selector, timeout=1000)  # 减少超时时间，快速跳过
+                        element = self.page.query_selector(selector)  # 立即返回，不等待
                         if element:
                             logger.info(f"【{self.pure_user_id}】在主页面找到滑块容器: {selector}")
                             slider_container = element
@@ -1668,7 +1524,6 @@ class XianyuSliderStealth:
                         except Exception as vis_e:
                             # 如果无法检查可见性，仍然使用该元素
                             logger.debug(f"【{self.pure_user_id}】无法检查元素可见性: {vis_e}，继续使用该元素")
-                            pass
                     
                     if element:
                         frame_info = "主页面" if search_frame == self.page else f"Frame"
@@ -1918,7 +1773,7 @@ class XianyuSliderStealth:
                 logger.warning(f"【{self.pure_user_id}】在所有frame中未找到轨道，尝试在主页面查找...")
                 for selector in track_selectors:
                     try:
-                        element = self.page.wait_for_selector(selector, timeout=1000)
+                        element = self.page.query_selector(selector)  # 立即返回，不等待
                         if element:
                             logger.info(f"【{self.pure_user_id}】在主页面找到滑块轨道: {selector}")
                             slider_track = element
@@ -2190,77 +2045,74 @@ class XianyuSliderStealth:
             return False
     
     def check_verification_failure(self):
-        """检查验证失败提示"""
+        """检查滑块是否给出了明确的失败提示。
+
+        只认验证组件自己的失败文案，且只在组件范围内找。原实现拿
+        ``page.content()`` 去匹配「重试」「失败」这类单字词 —— 整页 HTML 源码里
+        的 JS 字符串、类名，以及闲鱼自己的「哎哟喂，被挤爆啦，请稍后重试」都会命中，
+        于是一次**正在处理中**的验证被判成失败，还会顺带触发风控熔断。
+
+        Returns:
+            tuple: (是否确认失败, 重试按钮元素 or None)
+        """
         try:
             logger.info(f"【{self.pure_user_id}】检查验证失败提示...")
-            
+
             # 等待一下让失败提示出现（由于调用前已经等待了，这里等待时间缩短）
             time.sleep(1.5)
-            
-            # 检查页面内容中是否包含验证失败相关文字
-            page_content = self.page.content()
-            failure_keywords = [
-                "验证失败",
-                "点击框体重试", 
-                "重试",
-                "失败",
-                "请重试",
-                "验证码错误",
-                "滑动验证失败"
-            ]
-            
-            found_failure = False
-            for keyword in failure_keywords:
-                if keyword in page_content:
-                    logger.info(f"【{self.pure_user_id}】页面内容包含失败关键词: {keyword}")
-                    found_failure = True
-                    break
-            
-            if found_failure:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败关键词，验证失败")
-                return True, None
-            
-            # 检查各种可能的验证失败提示元素
-            failure_selectors = [
-                "text=验证失败，点击框体重试",
-                "text=验证失败",
-                "text=点击框体重试", 
-                "text=重试",
-                ".nc-lang-cnt",
-                "[class*='retry']",
-                "[class*='fail']",
-                "[class*='error']",
-                ".captcha-tips",
-                "#captcha-loading",
-                ".nc_1_nocaptcha",
-                ".nc_wrapper",
-                ".nc-container"
-            ]
-            
-            retry_button = None
-            for selector in failure_selectors:
+
+            frame = getattr(self, '_detected_slider_frame', None) or self.page
+
+            # 只在滑块组件内部取可见文本。取不到组件就说明它已经不在了，
+            # 那是成功的信号，不该在这里判失败。
+            container_text = ""
+            for selector in (".nc-container", "#nocaptcha", ".nc_wrapper"):
                 try:
-                    element = self.page.query_selector(selector)
-                    if element and element.is_visible():
-                        # 获取元素文本内容
-                        element_text = ""
-                        try:
-                            element_text = element.text_content()
-                        except:
-                            pass
-                        
-                        logger.info(f"【{self.pure_user_id}】找到验证失败提示: {selector}, 文本: {element_text}")
-                        retry_button = element
-                        break
-                except:
+                    container = frame.query_selector(selector)
+                    if container:
+                        container_text = container.text_content() or ""
+                        if container_text.strip():
+                            break
+                except Exception:
                     continue
-            
-            if retry_button:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败提示元素，验证失败")
-                return True, retry_button  # 返回找到的重试按钮元素
-            else:
-                logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
+
+            if not container_text.strip():
+                logger.info(f"【{self.pure_user_id}】滑块组件内无文本，未发现失败提示")
                 return False, None
+
+            found_keyword = next(
+                (kw for kw in SLIDER_FAILURE_KEYWORDS if kw in container_text),
+                None,
+            )
+            if found_keyword:
+                logger.info(
+                    f"【{self.pure_user_id}】滑块组件提示失败: {found_keyword}"
+                    f"（文本: {container_text.strip()[:60]}）"
+                )
+                # 必须返回二元组：调用方按 (has_failure, retry_element) 解包。
+                # 此处若返回裸 True 会抛 unpack 异常，导致重试按钮丢失、滑块无法重置，
+                # 后续尝试便会因控件停留在失败态而找不到轨道。
+                retry_button = None
+                for selector in (
+                    "text=点击框体重试",
+                    "text=验证失败",
+                    ".nc-lang-cnt",
+                    "[class*='retry']",
+                ):
+                    try:
+                        element = frame.query_selector(selector)
+                        if element and element.is_visible():
+                            retry_button = element
+                            break
+                    except Exception:
+                        continue
+                return True, retry_button
+
+            logger.info(
+                f"【{self.pure_user_id}】滑块组件未提示失败"
+                f"（文本: {container_text.strip()[:60]}）"
+            )
+            return False, None
 
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检查验证失败时出错: {e}")
@@ -2376,7 +2228,7 @@ class XianyuSliderStealth:
             fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
         """
         failure_records = []
-        current_strategy = 'ultra_fast'  # 极速策略
+        current_strategy = 'human_like'  # 拟人策略（旧的 ultra_fast 统计已作废，不再混算）
         
         for attempt in range(1, max_retries + 1):
             try:
@@ -2453,19 +2305,39 @@ class XianyuSliderStealth:
                         failure_info = self._analyze_failure(attempt, slide_distance, self.current_trajectory_data)
                         failure_records.append(failure_info)
 
-                    # 🔑 如果不是最后一次尝试，点击重试按钮后继续
+                    # 🔑 如果不是最后一次尝试，重置滑块后继续
                     if attempt < max_retries:
-                        # 点击重试按钮重置滑块
+                        reset_ok = False
+                        # 优先点重试按钮，这是最轻量的重置方式
                         if retry_element is not None:
                             logger.info(f"【{self.pure_user_id}】检测到重试按钮，点击重置滑块...")
                             if self.click_retry_button(retry_element):
                                 logger.success(f"【{self.pure_user_id}】✅ 已点击重试按钮，滑块已重置")
-                                # 等待滑块重新加载
                                 time.sleep(random.uniform(0.3, 0.6))
+                                reset_ok = True
                             else:
-                                logger.warning(f"【{self.pure_user_id}】点击重试按钮失败，继续尝试")
-                        else:
-                            logger.info(f"【{self.pure_user_id}】未检测到重试按钮，直接继续下一次尝试")
+                                logger.warning(f"【{self.pure_user_id}】点击重试按钮失败")
+
+                        # 没有重试按钮（或点击无效）时重新加载惩罚页。
+                        # 验证失败后 nc 控件会停在失败态：轨道消失、按钮不可拖，
+                        # 此时直接重试等于在坏掉的控件上空拖 —— 实测第3次成功率 0%。
+                        # 重新导航能拿到一个全新的滑块，让重试真正有意义。
+                        if not reset_ok and self._current_url:
+                            try:
+                                logger.info(f"【{self.pure_user_id}】控件已失效，重新加载验证页...")
+                                self.page.goto(
+                                    self._current_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=20000,
+                                )
+                                time.sleep(random.uniform(1.0, 1.8))
+                                # 页面重建后原有的 frame 引用全部失效，必须清掉
+                                self.slider_frame = None
+                                logger.success(f"【{self.pure_user_id}】✅ 验证页已重新加载")
+                            except Exception as reload_err:
+                                logger.warning(
+                                    f"【{self.pure_user_id}】重新加载验证页失败: {reload_err}"
+                                )
                         continue
                 
             except Exception as e:
@@ -2536,6 +2408,11 @@ class XianyuSliderStealth:
                 self.temp_dir = None  # 设置为None，防止重复清理
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理临时目录时出错: {e}")
+
+        # 归还浏览器槽位。放在最后，确保浏览器进程确实退出后才放行下一个任务。
+        if self._browser_slot_held:
+            self._browser_slot_held = False
+            browser_limit.release_slot("滑块验证")
         
         # 注销实例（最后执行，确保其他清理完成）
         try:
@@ -3085,6 +2962,9 @@ class XianyuSliderStealth:
         Returns:
             dict: Cookie字典，失败返回None
         """
+        # 槽位是否已占用。在 try 之前定义，确保后面任何异常路径的 finally
+        # 都能安全读到它。
+        password_login_slot_held = False
         try:
             # 检查日期有效性
             if not self._check_date_validity():
@@ -3145,14 +3025,17 @@ class XianyuSliderStealth:
                             logger.info(f"【{self.pure_user_id}】使用浏览器版本: {chromium_dir.name}")
                             break
             
-            # 启动浏览器
+            # 启动浏览器。先占槽位：这条路径由用户手动触发，但后台的 Cookie
+            # 刷新、滑块验证同样在抢 CPU，弱机上并存会让登录变得更慢更易失败。
+            browser_limit.acquire_slot("密码登录")
+            password_login_slot_held = True
             playwright = sync_playwright().start()
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=not show_browser,
                 args=browser_args,
                 viewport={'width': 1980, 'height': 1024},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                user_agent=CHROME_UA,
                 locale='zh-CN',  # 设置浏览器区域为中文
                 accept_downloads=True,
                 ignore_https_errors=True,
@@ -3982,12 +3865,24 @@ class XianyuSliderStealth:
                         playwright.stop()
                     except:
                         pass
+                finally:
+                    if password_login_slot_held:
+                        password_login_slot_held = False
+                        browser_limit.release_slot("密码登录")
         
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】密码登录流程异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
+        finally:
+            # 兜底归还槽位。占槽在浏览器启动之前，而正常释放它的 finally 属于
+            # 更靠后的内层 try —— 浏览器启动本身失败时（弱机启动超时、内存不足、
+            # Chromium 未安装）会直接跳到上面的 except，槽位就漏了。全局只有一个
+            # 槽位，漏一次之后所有浏览器任务都要卡满 300 秒超时才动得了。
+            if password_login_slot_held:
+                password_login_slot_held = False
+                browser_limit.release_slot("密码登录")
     
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
         """通过浏览器进行密码登录并获取Cookie (使用DrissionPage)
@@ -4054,9 +3949,11 @@ class XianyuSliderStealth:
                 # 有头模式窗口最大化
                 co.set_argument('--start-maximized')
             
-            # 设置用户代理
+            # 用户代理：默认保留内核真实 UA（与 Client Hints 一致），
+            # 只有显式配置了才覆盖。
             browser_features = self._get_random_browser_features()
-            co.set_user_agent(browser_features['user_agent'])
+            if browser_features.get('user_agent'):
+                co.set_user_agent(browser_features['user_agent'])
             
             # 设置中文语言
             co.set_argument('--lang=zh-CN')
@@ -4349,20 +4246,181 @@ class XianyuSliderStealth:
             except Exception as e:
                 logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
     
-    def run(self, url: str):
-        """运行主流程，返回(成功状态, cookie数据)"""
+    def _clean_singleton_lock_files(self, user_data_dir: str) -> None:
+        """清理持久化 profile 里的单例锁与崩溃标记。
+
+        浏览器被强杀（看门狗超时、容器重启）后，profile 里会留下 SingletonLock
+        等锁文件，以及 "exit_type": "Crashed" 的崩溃标记。下次启动时 Chrome 会
+        认为上次异常退出：轻则弹「未正确关闭」的恢复气泡挡住页面，重则新实例
+        拿不到单例锁而行为异常 —— 表现为滑块能找到、一拖就卡死在 Mouse.up，
+        直到看门狗再次强杀，于是每轮验证都白跑。
+        """
+        for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
+            path = os.path.join(user_data_dir, name)
+            try:
+                if os.path.islink(path) or os.path.exists(path):
+                    os.remove(path)
+                    logger.info(f"【{self.pure_user_id}】已清理残留锁文件: {name}")
+            except Exception as exc:
+                logger.warning(f"【{self.pure_user_id}】清理 {name} 失败: {exc}")
+
+        # 把上次的退出状态改成正常，避免弹出崩溃恢复气泡遮挡滑块
+        for rel in ('Default/Preferences', 'Preferences'):
+            pref_path = os.path.join(user_data_dir, rel)
+            if not os.path.exists(pref_path):
+                continue
+            try:
+                with open(pref_path, 'r', encoding='utf-8') as fp:
+                    prefs = json.load(fp)
+                profile = prefs.get('profile')
+                if not isinstance(profile, dict):
+                    continue
+                if profile.get('exit_type') == 'Normal' and not profile.get('exited_cleanly', True) is False:
+                    continue
+                profile['exit_type'] = 'Normal'
+                profile['exited_cleanly'] = True
+                with open(pref_path, 'w', encoding='utf-8') as fp:
+                    json.dump(prefs, fp, ensure_ascii=False)
+                logger.info(f"【{self.pure_user_id}】已重置浏览器退出状态: {rel}")
+            except Exception as exc:
+                logger.warning(f"【{self.pure_user_id}】重置 {rel} 退出状态失败: {exc}")
+
+    def _kill_browser_process(self) -> bool:
+        """强杀本账号的浏览器进程，返回是否杀掉了至少一个。
+
+        看门狗只能走这条路：Playwright 同步 API 不能跨线程调用，而进程被杀后
+        阻塞中的 CDP 调用会立刻报错返回。
+
+        用 user_data_dir 精确匹配，避免误杀用户自己开的浏览器或其他账号的实例。
+        """
+        # 命令行里的 user-data-dir 可能用 / 或 \（Windows Chrome 两种都接受），
+        # 不能依赖 os.sep；词边界避免 slider_123 误杀 slider_1234 的目录。
+        marker_pattern = re.compile(
+            rf"browser_data[/\\]slider_{re.escape(self.pure_user_id)}(?!\w)"
+        )
+        killed = 0
+
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+
+        if psutil is not None:
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info.get('cmdline') or [])
+                    if marker_pattern.search(cmdline):
+                        proc.kill()
+                        killed += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                    continue
+        else:
+            # 没装 psutil 时退回 pkill，匹配同一个 user_data_dir
+            try:
+                import subprocess
+                subprocess.run(
+                    ['pkill', '-f', marker],
+                    check=False, timeout=10,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                killed = 1
+            except Exception as exc:
+                logger.warning(f"【{self.pure_user_id}】pkill 终止浏览器失败: {exc}")
+
+        if killed:
+            logger.warning(
+                f"【{self.pure_user_id}】已强制结束 {killed} 个浏览器进程以解除阻塞"
+            )
+        return killed > 0
+
+    def _start_watchdog(self, timeout: float):
+        """超时仍未结束就强制干掉浏览器进程，返回可取消的定时器。
+
+        Playwright 的 mouse.move / bounding_box 这类调用没有超时参数：页面无响应时
+        会无限期阻塞在 CDP 往返上，既不抛错也不返回。此时浏览器不会关、全局槽位也
+        不会归还，而槽位只有一个 —— 后面每个浏览器任务都要先卡满等待超时。
+        """
+        def on_timeout():
+            logger.error(
+                f"【{self.pure_user_id}】滑块流程超过 {timeout:.0f} 秒未结束，"
+                "强制终止以释放浏览器槽位"
+            )
+            # 不能在这里调任何 Playwright 同步 API（包括 playwright.stop()）：
+            # 同步 API 绑定在创建它的线程上，从定时器线程调用会直接抛
+            # 「Cannot switch to a different thread」，等于看门狗白装。
+            # 改为直接杀浏览器进程 —— 进程一死，阻塞中的 CDP 调用立刻报错返回，
+            # 主流程得以走进 finally，由那里的 close_browser 归还槽位。
+            #
+            # 整体兜住异常：这里跑在定时器线程上，抛出去没人接，只会让线程
+            # 静默崩掉，看门狗就形同虚设。
+            try:
+                if not self._kill_browser_process():
+                    logger.warning(
+                        f"【{self.pure_user_id}】未能定位浏览器进程，"
+                        "槽位可能要等到获取超时后才释放"
+                    )
+            except Exception as exc:
+                logger.error(f"【{self.pure_user_id}】看门狗终止浏览器失败: {exc}")
+
+        timer = threading.Timer(timeout, on_timeout)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def run(self, url: str, cookies_str: str = None, timeout: float = None):
+        """运行主流程，返回(成功状态, cookie数据)
+
+        Args:
+            url: 滑块惩罚页地址
+            cookies_str: 账号 Cookie。必须注入，否则验证通过后拿到的
+                         x5sec 不绑定该账号，风控不会解除。
+            timeout: 整体超时（秒），超时强制关闭浏览器。默认 SLIDER_RUN_TIMEOUT。
+        """
         cookies = None
+        watchdog = self._start_watchdog(timeout or SLIDER_RUN_TIMEOUT)
         try:
             # 检查日期有效性
             if not self._check_date_validity():
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行")
                 return False, None
-            
+
             # 初始化浏览器
             self.init_browser()
-            
+
+            # 注入账号 Cookie —— 惩罚页的 x5secdata 绑定的是账号会话，
+            # 不带 Cookie 时即便滑块拖过，回收到的也只是空浏览器凭证（实测仅 164 字符），
+            # 风控状态不会解除。
+            if cookies_str:
+                try:
+                    pw_cookies = []
+                    for part in cookies_str.split(";"):
+                        part = part.strip()
+                        if "=" not in part:
+                            continue
+                        name, value = part.split("=", 1)
+                        pw_cookies.append({
+                            "name": name.strip(),
+                            "value": value.strip(),
+                            "domain": ".goofish.com",
+                            "path": "/",
+                        })
+                    if pw_cookies:
+                        self.context.add_cookies(pw_cookies)
+                        logger.info(
+                            f"【{self.pure_user_id}】已注入账号 Cookie（{len(pw_cookies)} 个字段）"
+                        )
+                except Exception as ck_err:
+                    logger.warning(f"【{self.pure_user_id}】注入 Cookie 失败: {ck_err}")
+            else:
+                logger.warning(
+                    f"【{self.pure_user_id}】未提供账号 Cookie —— 验证通过后风控可能不解除"
+                )
+
             # 导航到目标URL，快速加载
             logger.info(f"【{self.pure_user_id}】导航到URL: {url}")
+            # 记录下来供重试时重新加载 —— 验证失败后控件会锁死，
+            # 只有重新导航才能拿到可用的新滑块
+            self._current_url = url
             try:
                 self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
@@ -4455,6 +4513,7 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】执行过程中出错: {str(e)}")
             return False, None
         finally:
+            watchdog.cancel()
             # 关闭浏览器
             self.close_browser()
 

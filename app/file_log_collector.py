@@ -9,8 +9,7 @@ import time
 import threading
 from collections import deque
 from datetime import datetime
-from typing import List, Dict, Optional
-from pathlib import Path
+from typing import List, Dict
 
 class FileLogCollector:
     """基于文件监控的日志收集器"""
@@ -155,7 +154,11 @@ class FileLogCollector:
             logs_list = [log for log in logs_list if log['level'] == level_filter]
         
         if source_filter:
-            logs_list = [log for log in logs_list if source_filter.lower() in log['source'].lower()]
+            needle = source_filter.lower()
+            logs_list = [
+                log for log in logs_list
+                if needle in log['source'].lower() or needle in log['message'].lower()
+            ]
         
         # 返回最后N行
         return logs_list[-lines:] if len(logs_list) > lines else logs_list

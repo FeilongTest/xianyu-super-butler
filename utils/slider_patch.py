@@ -4,9 +4,10 @@
 """
 from typing import Any
 from loguru import logger
-from datetime import datetime, timedelta
+from utils import browser_limit
 import time
 import random
+from utils.user_agents import CHROME_UA
 
 
 def send_notification(user_id: str, title: str, message: str, notification_type: str = "info"):
@@ -68,6 +69,11 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                     
                     # 邮件通知
                     smtp_server = config_data.get('smtp_server', '')
+                    # 端口漏取会让下面几行直接抛 NameError，邮件通知整条路都走不通
+                    try:
+                        smtp_port = int(config_data.get('smtp_port') or 587)
+                    except (TypeError, ValueError):
+                        smtp_port = 587
                     email_user = config_data.get('email_user', '')
                     email_password = config_data.get('email_password', '')
                     recipient_email = config_data.get('recipient_email', '')
@@ -350,8 +356,13 @@ def _handle_slider_verification(page, user_id: str, max_attempts: int = 5) -> bo
                                     logger.info(f"【{user_id}】刷新后URL: {real_page.url}")
                                     logger.info(f"【{user_id}】重新开始验证...")
                                     
-                                    # 递归调用自身重新验证（减少尝试次数避免无限循环）
-                                    return _handle_slider_verification(real_page, user_id, max_attempts=max(5, max_attempts - 2))
+                                    # 递归调用自身重新验证（递减尝试次数；
+                                    # 预算耗尽必须终止，否则风控不解除时会无限刷新重试）
+                                    remaining_attempts = max_attempts - 2
+                                    if remaining_attempts < 1:
+                                        logger.warning(f"【{user_id}】滑块重试预算耗尽，停止验证避免无限循环")
+                                        return False
+                                    return _handle_slider_verification(real_page, user_id, max_attempts=remaining_attempts)
                                     
                                 except Exception as refresh_e:
                                     logger.error(f"【{user_id}】刷新页面失败: {refresh_e}")
@@ -660,8 +671,13 @@ def _handle_slider_verification(page, user_id: str, max_attempts: int = 5) -> bo
             
             if slider_appeared:
                 logger.info(f"【{user_id}】滑块已出现，重新开始验证...")
-                # 递归调用自身，重新验证（使用较少的尝试次数避免无限循环）
-                return _handle_slider_verification(real_page, user_id, max_attempts=5)
+                # 递归调用自身，重新验证（递减尝试次数；预算耗尽必须终止，
+                # 硬编码 5 会让每一轮都满血复活，风控不解除时就是无限循环）
+                remaining_attempts = max_attempts - 2
+                if remaining_attempts < 1:
+                    logger.warning(f"【{user_id}】滑块重试预算耗尽，停止验证避免无限循环")
+                    return False
+                return _handle_slider_verification(real_page, user_id, max_attempts=remaining_attempts)
             else:
                 logger.warning(f"【{user_id}】⚠️ 刷新后未检测到滑块，检查是否已登录成功...")
                 
@@ -1669,15 +1685,17 @@ def patch_login_with_password_headful():
             """
             重写的密码登录方法
             使用 Playwright 实现更稳定的登录流程（整合test_slider_login.py的完整逻辑）
-            
+
             Args:
                 account: 账号
                 password: 密码
                 show_browser: 是否显示浏览器
-            
+
             Returns:
                 dict: Cookie字典，失败返回None或空字典
             """
+            # 槽位是否已占用，供下方 finally 安全判断
+            patch_slot_held = False
             user_id = getattr(self, 'user_id', account)
             
             logger.info("开始密码登录流程...")
@@ -1720,12 +1738,14 @@ def patch_login_with_password_headful():
                     ]
                     
                     # 启动浏览器（使用持久化上下文）
+                    browser_limit.acquire_slot("密码登录(patch)")
+                    patch_slot_held = True
                     context = playwright.chromium.launch_persistent_context(
                         user_data_dir,  # 第一个参数就是用户数据目录
                         headless=not show_browser,
                         args=browser_args,
                         viewport={'width': 1980, 'height': 1024},
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                        user_agent=CHROME_UA,
                         accept_downloads=True,
                         ignore_https_errors=True
                     )
@@ -2146,6 +2166,12 @@ def patch_login_with_password_headful():
                             playwright.stop()
                         except:
                             pass
+                    finally:
+                        # 有头模式下浏览器留给用户手动关闭，这里也要归还槽位：
+                        # 否则那扇窗口不关，后续所有浏览器任务都会一直排队到超时。
+                        if patch_slot_held:
+                            patch_slot_held = False
+                            browser_limit.release_slot("密码登录(patch)")
             
             except Exception as e:
                 logger.error(f"【{user_id}】密码登录流程异常: {e}")

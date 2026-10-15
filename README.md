@@ -1,17 +1,200 @@
 # 闲鱼智控（闲鱼超级管家）
 
 面向闲鱼卖家的账号、商品、订单、消息、自动回复与自动发货一体化管理系统。
+*一款能让你的想法'变现'的强大作品*
+### 推荐使用云端版（GPT6自动过滑块+人工巡检）
+云端saas版本：https://xy.corleom.com/
+**本项目征集PR、功能更新，任何一个提交PR的作者会在未来获得顶配模型token奖励**
 
 [![GitHub Stars](https://img.shields.io/github/stars/23Star/xianyu-super-butler?style=flat&logo=github&color=f5b301)](https://github.com/23Star/xianyu-super-butler/stargazers)
+[![Version](https://img.shields.io/badge/Version-3.1.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-222222)](LICENSE)
 
-本项目基于 [zhinianboke/xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 二次开发并持续维护，保留原项目核心能力，同时重构管理端、账号监听、商品同步、订单处理和发货规则。
+**一个人把多个闲鱼账号做成一门自动运转的生意，让你的创意自动'变现'**
 
-## 项目效果
+多账号统一托管，买家下单自动发卡密、自动确认收货、自动评价、自动求小红花、收货后自动致谢。
+关键词和 AI 双层自动回复接住每一句咨询，商品与订单自动同步，滑块与人机验证自动处理。
+从「盯着手机一个个回」变成「打开网页看数据」。
 
-![闲鱼超级管家营收总览](docs/screenshots/revenue-overview.png)
+- 🏪 **多账号管理** — 扫码即接入，一个后台管完所有小号，逐账号独立配置策略
+- 📦 **自动发货** — 卡密自动发出，支持多规格、多数量，发货前风险拦截
+- 💬 **自动回复** — 关键词精确命中 + AI 议价，可设最低价与议价轮数，绝不越线让价
+- ⭐ **买家互动** — 确认收货后自动评价、自动求小红花、自动发送致谢文本
+- 🤖 **商品自动化** — 商品同步、素材库、定时擦亮、自动上下架
+- 📊 **经营看板** — 成交额、到账、退款、订单和库存一屏掌握，**历史订单可一次性拉回**
+
+![闲鱼超级管家运营概览](docs/screenshots/revenue-overview.png)
+
+## 核心功能
+
+| 模块 | 能力 |
+| --- | --- |
+| 总览 | 汇总营收、账号、订单、卡密库存和运行状态 |
+| 账号 | 扫码、密码或 Cookie 登录，资料同步，监听任务状态，暂停和自动回复配置 |
+| 商品 | 从闲鱼同步商品，维护本地详情、图片、规格、数量和商品回复 |
+| 商品自动化 | 商品筛选、素材库、发布记录、定时删除、短链修复和补偿任务 |
+| 订单 | 一键拉取闲鱼历史卖出订单，状态判定、详情补全、批量刷新、手动发货和异常保护 |
+| 卡密 | 卡券分组、库存导入、状态管理、多规格和多数量发货 |
+| 自动回复 | 账号关键词回复、默认回复和回复一次控制 |
+| 人工智能回复 | 兼容 OpenAI 协议的大模型配置、上下文对话和测试 |
+| 自动发货 | 全局、指定账号、指定商品三级发货规则及发货前风险拦截 |
+| 消息管理 | 闲鱼会话列表、消息收发、搜索筛选、回复决策日志和过滤规则 |
+| 通知与日志 | 通知渠道、账号绑定、风险日志和系统日志 |
+| 设置 | 管理员账号与改密、注册与邮箱验证开关、服务、备份及系统配置 |
+| 公告与更新 | 从自建地址拉取公告与版本信息，首页横幅提示，「关于」页手动检查更新 |
+
+## 界面预览
+
+### 账号管理：一个后台管完所有小号
+
+扫码添加账号，实时显示监听状态。每个账号可独立设置自动确认、人工接入暂停时长、
+是否启用 AI 回复，互不干扰。
+
+![账号管理](docs/screenshots/accounts.png)
+
+### 商品与发货：卡密自动发到买家手上
+
+同步在售商品，逐个商品绑定发货内容，支持多规格和多数量。已下架的商品会被标记出来
+并默认隐藏，不和在售的混在一起。
+
+![商品与发货](docs/screenshots/items-delivery.png)
+
+### 订单管理：接入前的历史订单也能一次拉回来
+
+「拉取卖出订单」会把闲鱼上的历史订单整批同步进来，不只是接入之后的新单，
+所以刚部署就能看到完整的经营数据。状态、买家、实付金额和发货情况一目了然，
+支持按账号和状态筛选，也能手动发货或补发。
+
+![订单管理](docs/screenshots/orders.png)
+
+### 买家互动：确认收货后的动作全部自动完成
+
+评价买家、索要小红花、发送收货致谢，三项都能逐账号开关。买家一确认收货，
+致谢立即发出，评价和求花在订单状态就绪后自动执行。
+
+![买家互动](docs/screenshots/buyer-interaction.png)
+
+### 消息中心：所有账号的会话在一个页面里
+
+跨账号会话列表，支持搜索和筛选，可以直接接管对话。自动回复的每一次决策都有日志，
+能查到为什么回了、为什么没回。
+
+![消息中心](docs/screenshots/message-center.png)
+
+## 如何部署
+
+> **⚠️ 请勿部署到 Hugging Face Spaces 等共享托管平台**
+>
+> 本项目内置反检测浏览器（Patchright）、验证码处理（CAPTCHA/Geetest）与 Telegram 通知等组件，
+> 这类组合极易被共享平台判定为滥用（platform abuse），已有多起导致账号被封、其他 Space 受牵连的先例。
+> 此外，海外出口 IP 也会显著增加闲鱼自有风控的触发概率。
+> **推荐部署到本地设备、自有 VPS 或国内服务器。**
+
+### 一条命令直接启动（最快，不用克隆仓库）
+
+有 Docker 就能跑，不需要下载源码：
+
+```bash
+docker run -d --name xianyu-butler \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/backups:/app/backups \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=改成你自己的密码 \
+  --restart unless-stopped \
+  ghcr.io/23star/xianyu-super-butler:latest
+```
+
+浏览器打开 `http://服务器IP:8080` 即可。数据都在当前目录的 `data` / `logs` / `backups` 里，
+升级只需 `docker pull` 后重建容器，数据不丢。
+
+Windows PowerShell 把 `$(pwd)` 换成 `${PWD}`，续行的 `\` 换成反引号 `` ` ``。
+
+### Docker Compose（推荐长期使用）
+
+```bash
+git clone https://github.com/23Star/xianyu-super-butler.git
+cd xianyu-super-butler
+docker compose -f docker-compose.nas.yml up -d
+```
+
+同样是预构建镜像，不在本机编译任何东西，支持 amd64 / arm64。相比上面一条命令，
+Compose 的好处是配置写在文件里、改起来清楚，升级也只有一行命令。
+
+该配置不依赖 `.env`，管理员账号密码在 `docker-compose.nas.yml` 里的 `CHANGE_ME` 处直接改。
+
+### NAS 与低配设备（飞牛 fnOS、群晖、威联通、软路由、低配 VPS）
+
+**用上面那条命令，不要本地构建。**
+
+`npm ci`、前端打包、Python 依赖编译和 Chromium 下载会同时抢占 CPU 和内存，
+轻则卡十几分钟，重则内存不足被杀，反复重启表现为「装不上、机器卡死」。
+预构建镜像已同时提供 amd64 和 arm64，绕开全部编译步骤。
+
+```bash
+docker compose -f docker-compose.nas.yml up -d
+```
+
+飞牛 fnOS、群晖等图形界面的 Docker 通常没地方放 `.env`，所以这份配置把变量直接写在
+compose 文件里，改完 `CHANGE_ME` 就能用。
+
+### Docker 本地构建（需要改代码时）
+
+```bash
+cp .env.example .env          # 不改也能启动，此时使用默认密码
+docker compose up -d --build
+```
+
+国内网络用 CN 配置（apt、pip、npm、Chromium 全部走国内镜像）：
+
+```bash
+docker compose -f docker-compose-cn.yml up -d --build
+```
+
+可选 Nginx：`docker compose --profile with-nginx up -d --build`
+
+### 源码运行（开发调试）
+
+需要 Python 3.11+、Node.js 20+、npm。
+
+```bash
+git clone https://github.com/23Star/xianyu-super-butler.git
+cd xianyu-super-butler
+
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+playwright install chromium
+
+cd frontend && npm ci && npm run build && cd ..
+python Start.py
+```
+
+### 访问
+
+- 管理页面：`http://localhost:8080/`
+- API 文档：`http://localhost:8080/docs`
+- 健康检查：`http://localhost:8080/health`
+
+默认管理员 **admin / admin123**，登录后请在「设置 → 账号与同步 → 修改登录密码」立即改掉。
+
+数据持久化到 `./data`（数据库）、`./logs`（日志）、`./backups`（备份）。
+
+### 更新
+
+```bash
+# 预构建镜像（推荐方式对应的更新命令）
+docker compose -f docker-compose.nas.yml pull && docker compose -f docker-compose.nas.yml up -d
+
+# 本地构建
+git pull && docker compose up -d --build
+```
+
+> **滑块与人机验证、部署失败排查、使用流程** 见 [docs/deployment.md](docs/deployment.md)。
+> 自动过滑块受平台风控限制不保证成功，自动失败时可在账号页转人工验证。
 
 ## 交流与反馈
 
@@ -32,236 +215,9 @@
 
 缺陷和功能建议请提交到 [GitHub Issues](https://github.com/23Star/xianyu-super-butler/issues)。
 
-## 核心能力
-
-| 模块 | 当前能力 |
-| --- | --- |
-| 总览 | 汇总营收、账号、订单、卡密库存和运行状态 |
-| 账号 | 扫码、密码或 Cookie 登录，资料同步，监听任务状态，暂停和自动回复配置 |
-| 商品 | 从闲鱼同步商品，维护本地详情、图片、规格、数量和商品回复 |
-| 商品自动化 | 商品筛选、素材库、发布记录、定时删除、短链修复和补偿任务 |
-| 订单 | 订单同步、状态判定、详情补全、批量刷新、手动发货和异常保护 |
-| 卡密 | 卡券分组、库存导入、状态管理、多规格和多数量发货 |
-| 自动回复 | 账号关键词回复、默认回复和回复一次控制 |
-| 人工智能回复 | 兼容 OpenAI 协议的大模型配置、上下文对话和测试 |
-| 自动发货 | 全局、指定账号、指定商品三级发货规则及发货前风险拦截 |
-| 消息管理 | 闲鱼会话列表、消息收发、搜索筛选、回复决策日志和过滤规则 |
-| 通知与日志 | 通知渠道、账号绑定、风险日志和系统日志 |
-| 设置 | 管理员、安全、服务、备份及系统配置 |
-
-管理端导航：
-
-`总览 → 账号 → 商品 → 商品自动化 → 订单 → 卡密 → 自动回复 → 人工智能回复 → 自动发货 → 消息管理 → 通知与日志 → 设置`
-
-## 关键改进
-
-### 登录后自动启动业务监听
-
-账号扫码、密码或 Cookie 登录成功后，系统会保存有效 Cookie，并确保该账号的后台监听任务处于运行状态。监听任务负责接收买家消息、触发自动回复、识别订单事件和执行自动发货。
-
-账号页面会分别显示：
-
-- `在线 / 离线`：Cookie 和闲鱼连接状态
-- `监听中`：后台消息与订单任务正在运行
-- `监听异常`：任务意外退出，可重新登录或重新启用账号触发重启
-- `已停用`：该账号被手动停用，不会处理消息和订单
-
-仅显示“在线”但没有“监听中”时，请先查看“通知与日志”中的启动错误。
-
-### 每个商品独立发货
-
-自动发货规则支持三个范围：
-
-1. `指定账号 + 指定商品`：按商品 ID 精确发货，优先级最高，关键词可留空。
-2. `指定账号 + 关键词`：只匹配该账号下的商品标题、详情或买家消息。
-3. `全部账号 + 关键词`：通用兜底规则。
-
-配置路径：`自动发货 → 添加发货规则 → 选择账号 → 选择商品 → 关联卡券`。
-
-### 单一生产入口
-
-- 完整管理页面：`http://localhost:8080/`
-- API 文档：`http://localhost:8080/docs`
-- 健康检查：`http://localhost:8080/health`
-
-生产前端由 FastAPI 直接提供，不需要单独运行 `3000` 端口。
-
-## 界面预览
-
-### 运营总览
-
-![运营总览](docs/screenshots/dashboard.png)
-
-### 账号与监听状态
-
-![账号管理](docs/screenshots/accounts.png)
-
-### 商品自动化
-
-![商品自动化](docs/screenshots/product-automation.png)
-
-### 闲鱼消息管理
-
-![消息管理](docs/screenshots/message-management.png)
-
-### 单商品发货规则
-
-![单商品发货规则](docs/screenshots/product-delivery-rule.png)
-
-## 本地安装
-
-环境要求：
-
-- Python 3.11+
-- Node.js 20+
-- npm
-- Windows 10/11 或常见 Linux 发行版
-
-```powershell
-git clone https://github.com/23Star/xianyu-super-butler.git
-cd xianyu-super-butler
-
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-playwright install chromium
-
-cd frontend
-npm ci
-npm run build
-cd ..
-
-python Start.py
-```
-
-启动完成后访问 `http://localhost:8080/`。
-
-默认管理员：
-
-```text
-用户名：admin
-密码：admin123
-```
-
-首次登录后立即修改默认密码。
-
-## Docker 部署
-
-1. 创建环境文件：
-
-```bash
-cp .env.example .env
-```
-
-2. 修改 `.env`，至少设置强密码和随机密钥：
-
-```dotenv
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=replace-with-a-strong-password
-JWT_SECRET_KEY=replace-with-at-least-32-random-characters
-```
-
-3. 构建并启动：
-
-```bash
-docker compose up -d --build
-docker compose ps
-docker compose logs -f xianyu-app
-```
-
-国内镜像配置：
-
-```bash
-docker compose -f docker-compose-cn.yml up -d --build
-```
-
-可选 Nginx：
-
-```bash
-docker compose --profile with-nginx up -d --build
-```
-
-数据默认持久化到：
-
-- `./data`：SQLite 数据库
-- `./logs`：运行日志
-- `./backups`：备份文件
-
-## 部署失败排查
-
-重复部署失败通常不是前端问题，优先按以下顺序检查：
-
-1. **确认版本**：使用 Docker Engine 24+、Docker Compose v2 和至少 2 GB 可用内存。
-2. **确认 `.env`**：未设置 `ADMIN_PASSWORD` 或 `JWT_SECRET_KEY` 时，Compose 会主动拒绝启动。
-3. **确认端口**：`8080` 被占用时，在 `.env` 设置 `WEB_PORT=8081`，然后访问对应端口。
-4. **确认目录权限**：容器必须能够写入 `data`、`logs` 和 `backups`。
-5. **等待首次构建**：首次构建会安装 Python 依赖和 Playwright Chromium，网络较慢时耗时明显。
-6. **检查健康状态**：运行 `docker compose ps`，健康接口应返回 `healthy`。
-7. **查看真实错误**：运行 `docker compose logs --tail=200 xianyu-app`，不要只看浏览器“无法访问”。
-8. **清理失败构建缓存**：确认数据已备份后运行 `docker compose build --no-cache xianyu-app`，再重新启动。
-
-常用诊断命令：
-
-```bash
-docker compose config
-docker compose ps
-docker compose logs --tail=200 xianyu-app
-curl http://localhost:8080/health
-```
-
-## 使用流程
-
-1. 登录后台并修改默认管理员密码。
-2. 在“账号”页面登录闲鱼账号，等待状态显示“在线”和“监听中”。
-3. 在“商品”页面选择账号并同步商品。
-4. 在“卡密”页面创建卡券分组并导入库存。
-5. 在“自动回复”或“人工智能回复”配置客服策略。
-6. 在“自动发货”中为指定商品绑定卡券，或设置账号级、全局关键词规则。
-7. 在“订单”和“消息管理”页面核对实际触发结果。
-8. 在“通知与日志”中排查过滤、暂停、无规则、发送失败和监听退出。
-
-扫码登录成功后，系统会先保存已验证的核心 Cookie 并更新账号状态，再在后台补全浏览器 Cookie。商品同步会对比页面声明数量、接口解析数量和数据库保存数量，数量不一致时给出明确提示。
-
-## 更新与验证
-
-更新代码：
-
-```bash
-git pull
-docker compose up -d --build
-```
-
-后端测试：
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
-.\.venv\Scripts\python.exe -m compileall -q Start.py XianyuAutoAsync.py app utils tests
-```
-
-前端检查：
-
-```powershell
-cd frontend
-.\node_modules\.bin\tsc.cmd --noEmit
-npm run build
-```
-
-## 数据与安全
-
-- 不要提交数据库、日志、Cookie、Token、卡密、浏览器状态和本地配置。
-- 日志不得输出完整 Cookie、Authorization、签名或模型 API Key。
-- 自动发货、发送卡密、删除商品等操作应先用测试账号验证。
-- 闲鱼页面和接口可能随平台更新变化，升级后应重新验证登录、消息、商品和订单链路。
-- 当前仍兼容旧版无盐 SHA-256 密码哈希，不建议未经额外防护直接暴露到公网。
-
-## 技术栈
-
-- 后端：FastAPI、Python 3.11、SQLite、Playwright、WebSocket、Asyncio
-- 前端：React 19、TypeScript、Vite、Tailwind CSS
-- 部署：Docker Compose，可选 Nginx
-
 ## 许可与声明
+
+本项目基于 [zhinianboke/xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 二次开发并持续维护，保留原项目核心能力，同时重构管理端、账号监听、商品同步、订单处理和发货规则。感谢原作者的开源工作。
 
 项目使用 [GNU Affero General Public License v3.0](LICENSE)。修改、部署或通过网络提供服务时，请遵守 AGPL-3.0 的源代码公开义务。
 

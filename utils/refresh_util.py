@@ -1,21 +1,16 @@
-import json
 import time
 import os
-import sys
-import re
 import hashlib
-import base64
-import struct
 import math
-from typing import Any, Dict, List
+from typing import Dict
 import requests
 from loguru import logger
-import asyncio
 
 import time
 import random
 from loguru import logger
 from DrissionPage import Chromium, ChromiumOptions
+from utils.user_agents import CHROME_UA
 
 def log_captcha_event(cookie_id: str, event_type: str, success: bool = None, details: str = ""):
     """简单记录滑块验证事件到txt文件"""
@@ -1754,7 +1749,7 @@ class XianyuApis:
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-site',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+            'user-agent': CHROME_UA,
         })
         
     def clear_duplicate_cookies(self):
@@ -1845,7 +1840,7 @@ class XianyuApis:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',
@@ -1914,7 +1909,7 @@ class XianyuApis:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',

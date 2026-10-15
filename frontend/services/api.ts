@@ -1,20 +1,68 @@
-import { get, post, put, del } from '../lib/request';
+import { get, post, put, del, patch } from '../lib/request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
-  AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
+  AdminStats, AdminUser, Card, CardShipment, SystemSettings, ApiResponse, OrderAnalytics,
   Item, ItemDeliveryConfig, ItemDeliveryConfigSummary,
   ProductVariantBinding, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
   DeliveryBlockRule, PersonalBlacklistEntry, MessageNotification,
   NotificationChannel, NotificationChannelType, RiskControlLog, SystemLog,
+  NotificationEventDefinition, NotificationPriorityDefinition,
   MessageFilter, MessageFilterType, AutoReplyLog
   , ChatAccount, ChatConversation, ChatMessage, ProductMaterial,
   ProductFilterRule, ProductDeleteRule, AutomationTaskRun,
-  ProductAutomationResult, ProductDeletePreview, AutoRatingSettings
+  ProductAutomationResult, ProductDeletePreview, AutoRatingSettings, QuickPhrase,
+  AnnouncementPayload
 } from '../types';
 
 // Auth
-export const login = async (data: { username?: string; password?: string; email?: string; verification_code?: string }): Promise<LoginResponse> => {
+export const login = async (data: {
+  username?: string;
+  password?: string;
+  email?: string;
+  verification_code?: string;
+  /** 连续登录失败被要求图形验证码时必填 */
+  captcha_session_id?: string;
+  captcha_code?: string;
+}): Promise<LoginResponse> => {
   return post('/login', data);
+};
+
+/** 登录页需要的开关，未登录也能取。 */
+export const getPublicSettings = async (): Promise<{
+  registration_enabled?: string;
+  show_default_login_info?: string;
+  login_captcha_enabled?: string;
+  email_verification_enabled?: string;
+}> => {
+  return get('/system-settings/public');
+};
+
+export const register = async (data: {
+  username: string;
+  email: string;
+  password: string;
+  verification_code?: string;
+}): Promise<ApiResponse> => {
+  return post('/register', data);
+};
+
+/** 发送邮箱验证码。type 区分注册和登录场景；发送前须先通过图形验证码。 */
+export const sendVerificationCode = async (
+  email: string,
+  type: 'register' | 'login' = 'register',
+  captcha?: { session_id: string; code: string },
+): Promise<ApiResponse> => {
+  return post('/send-verification-code', { email, type, ...captcha });
+};
+
+/** 拉取图形验证码图片。sessionId 由前端生成，验证时原样带回。 */
+export const generateCaptcha = async (sessionId: string): Promise<{
+  success: boolean;
+  captcha_image: string;
+  session_id: string;
+  message?: string;
+}> => {
+  return post('/generate-captcha', { session_id: sessionId });
 };
 
 export const verifyToken = async (): Promise<{ authenticated: boolean; user_id?: number; username?: string; is_admin?: boolean }> => {
@@ -31,38 +79,33 @@ export const changePassword = async (currentPassword: string, newPassword: strin
 
 // Accounts
 export const getAccountDetails = async (): Promise<AccountDetail[]> => {
+  // 只发一次请求。原实现拿到账号列表后，再逐个请求 /cookie/{id}/details 补
+  // username/password/show_browser —— 而列表接口内部本来就查了同一份详情，
+  // 等于对同一份数据做 N+1。页面上有 7 处组件各自调用本函数，账号一多首屏
+  // 就被这些重复请求拖慢；现在列表接口直接返回这几个字段。
   const data = await get<any[]>('/cookies/details');
-  return Promise.all(data.map(async item => {
-    let details: any = {};
-    try {
-      details = await get(`/cookie/${item.id}/details`);
-    } catch {
-      // 详情加载失败时保留基础账号数据，避免整页不可用。
-    }
-
-    return {
-      ...details,
-      id: item.id,
-      value: item.value,
-      cookie: item.value,
-      enabled: item.enabled,
-      auto_confirm: item.auto_confirm,
-      remark: item.remark,
-      note: item.remark,
-      pause_duration: item.pause_duration,
-      username: details.username,
-      login_password: details.password || details.login_password,
-      show_browser: details.show_browser,
-      nickname: item.nickname || details.nickname || item.remark || details.username || `账号 ${item.id.substring(0, 6)}`,
-      avatar_url: item.avatar_url || details.avatar_url,
-      location: item.location || details.location,
-      bio: item.bio || details.bio,
-      followers: item.followers ?? details.followers,
-      following: item.following ?? details.following,
-      profile_updated_at: item.profile_updated_at || details.profile_updated_at,
-      ai_enabled: false,
-    };
-  }));
+  return data.map(item => ({
+    id: item.id,
+    value: item.value,
+    cookie: item.value,
+    enabled: item.enabled,
+    auto_confirm: item.auto_confirm,
+    remark: item.remark,
+    note: item.remark,
+    pause_duration: item.pause_duration,
+    username: item.username,
+    login_password: item.login_password,
+    show_browser: item.show_browser,
+    nickname: item.nickname || item.remark || item.username || `账号 ${item.id.substring(0, 6)}`,
+    avatar_url: item.avatar_url,
+    location: item.location,
+    bio: item.bio,
+    followers: item.followers,
+    following: item.following,
+    profile_updated_at: item.profile_updated_at,
+    runtime_state: item.runtime_state,
+    ai_enabled: false,
+  })) as AccountDetail[];
 };
 
 export const refreshAccountProfile = async (id: string): Promise<{ success: boolean; profile?: Partial<AccountDetail> }> => {
@@ -163,7 +206,8 @@ export const getOrders = async (
     total: res.total || orders.length,
     page: res.page || page,
     page_size: res.page_size || pageSize,
-    total_pages: res.total_pages || 1
+    total_pages: res.total_pages || 1,
+    status_counts: res.status_counts
   };
 };
 
@@ -265,9 +309,227 @@ export const importOrders = async (data: Partial<Order>[] | FormData): Promise<a
   return response.json();
 }
 
+// 卖家端订单同步与互动
+export const syncSoldOrders = async (cookieId?: string, days = 7): Promise<any> => {
+  const formData = new FormData();
+  if (cookieId) formData.append('cookie_id', cookieId);
+  formData.append('days', String(days));
+
+  const response = await fetch('/api/orders/sync-sold', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
+    body: formData
+  });
+  return response.json();
+};
+
+export const getOrderRefundRecord = async (orderId: string): Promise<any> => {
+  return get(`/api/orders/${orderId}/refund-record`);
+};
+
+// 快捷短语：人工客服常用话术
+export const getQuickPhrases = async (includeDisabled = false): Promise<QuickPhrase[]> => {
+  const res = await get<{ success: boolean; data: QuickPhrase[] }>(
+    '/quick-phrases', { include_disabled: includeDisabled }
+  );
+  return res.data || [];
+};
+
+export const createQuickPhrase = async (
+  title: string, content: string, category = '默认', sortOrder = 0
+): Promise<any> => {
+  const formData = new FormData();
+  formData.append('title', title);
+  formData.append('content', content);
+  formData.append('category', category);
+  formData.append('sort_order', String(sortOrder));
+
+  const response = await fetch('/quick-phrases', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
+    body: formData
+  });
+  return response.json();
+};
+
+export const updateQuickPhrase = async (
+  id: number, fields: Partial<Pick<QuickPhrase, 'title' | 'content' | 'category' | 'sort_order' | 'enabled'>>
+): Promise<any> => {
+  const formData = new FormData();
+  Object.entries(fields).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) formData.append(key, String(value));
+  });
+
+  const response = await fetch(`/quick-phrases/${id}`, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
+    body: formData
+  });
+  return response.json();
+};
+
+export const deleteQuickPhrase = async (id: number): Promise<any> => {
+  return del(`/quick-phrases/${id}`);
+};
+
+export const useQuickPhrase = async (id: number): Promise<any> => {
+  return post(`/quick-phrases/${id}/use`);
+};
+
+// 风控熔断状态：命中平台风控后账号会暂停请求
+export const getRiskControlStatus = async (): Promise<{
+  success: boolean;
+  blocked_count: number;
+  accounts: Array<{
+    cookie_id: string;
+    blocked: boolean;
+    remaining_seconds: number;
+    consecutive_hits: number;
+    reason: string;
+    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control';
+    verification_message: string;
+    verification_url?: string;
+    latest_event: string;
+    latest_event_at?: string;
+  }>;
+}> => {
+  return get('/api/risk-control/status');
+};
+
+// 实时取一个新鲜的验证链接。punish 链接的 x5secdata 只能用一次、约 1 小时失效，
+// 直接用风控日志里的历史链接打开只会看到「抱歉，页面访问出现了问题」。
+export const requestFreshCaptchaUrl = async (cookieId: string): Promise<{
+  success: boolean;
+  need_verify: boolean;
+  verification_url?: string;
+  message: string;
+}> => {
+  return post(`/api/risk-control/${encodeURIComponent(cookieId)}/fresh-captcha-url`);
+};
+
+export const startManualCaptchaSession = async (
+  cookieId: string,
+  timeout: number = 300,
+): Promise<{
+  success: boolean;
+  message: string;
+  session_id: string;
+}> => {
+  const formData = new FormData();
+  formData.append('cookie_id', cookieId);
+  formData.append('timeout', String(timeout));
+  return post('/api/captcha/manual-session', formData, { timeout: (timeout + 30) * 1000 });
+};
+
+// 商品擦亮：重新获取搜索曝光，平台对每日次数有限制
+export const polishItems = async (cookieId?: string, itemIds?: string[]): Promise<any> => {
+  const formData = new FormData();
+  if (cookieId) formData.append('cookie_id', cookieId);
+  if (itemIds?.length) formData.append('item_ids', itemIds.join(','));
+
+  const response = await fetch('/api/items/polish', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
+    body: formData
+  });
+  return response.json();
+};
+
+// 物流轨迹
+export const getOrderLogistics = async (orderId: string): Promise<any> => {
+  return get(`/api/orders/${orderId}/logistics`);
+};
+
+// 发货信息：规格、收货信息、支持的发货方式
+export const getOrderConsignInfo = async (orderId: string): Promise<any> => {
+  return get(`/api/orders/${orderId}/consign-info`);
+};
+
+// 会向买家发送消息，需先在设置中开启
+export const requireOrderFlower = async (orderId: string): Promise<any> => {
+  return post(`/api/orders/${orderId}/require-flower`);
+};
+
+export const receiveOrderFlower = async (orderId: string): Promise<any> => {
+  return post(`/api/orders/${orderId}/receive-flower`);
+};
+
+// 买家互动开关状态。开关按账号存，accounts 是逐账号的映射；
+// 顶层两个布尔表示「是否有任意账号开启」，用于决定整块入口要不要出现。
+export interface BuyerInteractionFlags {
+  auto_rate_enabled: boolean;
+  auto_flower_enabled: boolean;
+  /** 确认收货后自动给买家发一条致谢文本 */
+  auto_thanks_enabled: boolean;
+  auto_receive_flower_enabled: boolean;
+}
+
+export const getSellerFeatureFlags = async (): Promise<{
+  accounts?: Record<string, BuyerInteractionFlags>;
+  auto_rate_enabled: boolean;
+  auto_flower_enabled: boolean;
+  auto_receive_flower_enabled: boolean;
+  auto_rate_template?: string;
+}> => {
+  return get('/api/seller-features');
+};
+
+// 按账号更新评价/求花开关
+export const updateSellerFeatureFlags = async (
+  cookieId: string,
+  payload: Partial<BuyerInteractionFlags>,
+): Promise<BuyerInteractionFlags> => {
+  return put(`/api/seller-features/${cookieId}`, payload);
+};
+
+// 评价提交后不可撤销，需先在设置中开启
+export const rateOrders = async (
+  orderIds: string[],
+  feedback: string,
+  rate: 1 | 0 | -1 = 1,
+  anonymous = false
+): Promise<any> => {
+  const formData = new FormData();
+  formData.append('order_ids', orderIds.join(','));
+  formData.append('feedback', feedback);
+  formData.append('rate', String(rate));
+  formData.append('anonymous', String(anonymous));
+
+  const response = await fetch('/api/orders/rate', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
+    body: formData
+  });
+  return response.json();
+};
+
 // Stats
 export const getAdminStats = async (): Promise<AdminStats> => {
   return get('/admin/stats');
+};
+
+// User Management（管理员专用）
+export const getAdminUsers = async (): Promise<AdminUser[]> => {
+  const res = await get<{ users: AdminUser[] }>('/admin/users');
+  return res.users || [];
+};
+
+/** 启用/禁用用户。禁用会同时踢掉该用户的全部在线会话。 */
+export const setAdminUserStatus = async (
+  userId: number,
+  isActive: boolean,
+): Promise<ApiResponse & { revoked_tokens?: number }> => {
+  return patch(`/admin/users/${userId}/status`, { is_active: isActive });
+};
+
+/** 重置用户密码。重置后该用户的所有会话会被强制下线。 */
+export const resetAdminUserPassword = async (userId: number, newPassword: string): Promise<ApiResponse> => {
+  return put(`/admin/users/${userId}/password`, { new_password: newPassword });
+};
+
+/** 删除用户及其全部业务数据（账号、卡密、规则等），不可恢复。 */
+export const deleteAdminUser = async (userId: number): Promise<ApiResponse> => {
+  return del(`/admin/users/${userId}`);
 };
 
 export const getOrderAnalytics = async (daysOrParams: number | {start_date: string; end_date: string} = 7): Promise<OrderAnalytics> => {
@@ -316,6 +578,25 @@ export const deleteCard = async (cardId: string | number): Promise<ApiResponse> 
 
 export const getCardDetails = async (cardId: string | number): Promise<any> => {
   return get(`/cards/${cardId}`);
+};
+
+/** 已发货的批量卡密记录，按时间倒序。 */
+export const getCardShipments = async (limit = 200): Promise<{ total: number; shipments: CardShipment[] }> => {
+  const res = await get<{ success: boolean; total: number; shipments: CardShipment[] }>(
+    '/cards/shipped', { limit }
+  );
+  return { total: res.total || 0, shipments: res.shipments || [] };
+};
+
+export const clearCardShipments = async (): Promise<ApiResponse & { deleted?: number }> => {
+  return del('/cards/shipped');
+};
+
+/** 上传图片，返回服务端相对路径（卡密发货文案插图等）。 */
+export const uploadImage = async (file: File): Promise<{ image_url: string; message?: string }> => {
+  const formData = new FormData();
+  formData.append('image', file);
+  return post('/upload-image', formData);
 };
 
 // Items
@@ -393,6 +674,50 @@ export const saveItemDeliveryConfig = async (
     config,
   );
 }
+
+export type DeliverySkuOption = {
+  key: string;
+  name: string;
+  platform_sku_id?: string;
+  source?: string;
+};
+
+export type DeliverySkuDiscovery = {
+  options: DeliverySkuOption[];
+  detection_status: string;
+  retry_after_seconds?: number;
+  warning?: string;
+};
+
+const normalizeDeliverySkuDiscovery = (data: Partial<DeliverySkuDiscovery>): DeliverySkuDiscovery => ({
+  options: data.options || [],
+  detection_status: data.detection_status || 'ok',
+  retry_after_seconds: data.retry_after_seconds,
+  warning: data.warning,
+});
+
+export const getDeliverySkuOptions = async (cookieId: string, itemId: string): Promise<DeliverySkuDiscovery> => {
+  const response = await get<Partial<DeliverySkuDiscovery>>(
+    `/api/anti-abuse/sku-options/${encodeURIComponent(itemId)}`,
+    { cookie_id: cookieId },
+  );
+  return normalizeDeliverySkuDiscovery(response);
+};
+
+/** 卖家接口返回 unauthorized 后由用户显式触发的买家接口兜底，只调一次、不自动重试。 */
+export const buyerTestDeliverySkuOptions = async (cookieId: string, itemId: string): Promise<DeliverySkuDiscovery> => {
+  const response = await get<Partial<DeliverySkuDiscovery>>(
+    `/api/anti-abuse/sku-options/${encodeURIComponent(itemId)}/buyer-test`,
+    { cookie_id: cookieId },
+  );
+  return normalizeDeliverySkuDiscovery(response);
+};
+
+export const saveDeliverySkuRules = async (cookieId: string, itemId: string, skus: Array<{
+  key: string; name: string; max_deliveries: number; block_message: string; enabled: boolean;
+}>): Promise<void> => {
+  await put(`/api/anti-abuse/sku-configs/${encodeURIComponent(itemId)}?cookie_id=${encodeURIComponent(cookieId)}`, { skus });
+};
 
 // Product Automation
 export const getProductMaterials = async (cookieId?: string): Promise<ProductMaterial[]> => {
@@ -656,6 +981,19 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>): P
     return { success: true, message: 'Settings saved' };
 };
 
+export interface EmailTestPayload {
+    to: string;
+    smtp_server: string;
+    smtp_port: number;
+    smtp_user: string;
+    smtp_password: string;
+    smtp_from: string;
+}
+
+export const sendTestEmail = async (payload: EmailTestPayload): Promise<{ success: boolean; message: string }> => {
+    return post('/system-settings/email-test', payload);
+};
+
 export const getAccountAISettings = async (cookieId: string): Promise<AIReplySettings> => {
     return get(`/ai-reply-settings/${cookieId}`);
 }
@@ -740,6 +1078,19 @@ export const deleteNotificationChannel = async (channelId: string): Promise<ApiR
 }
 
 // Message Notifications
+export const getNotificationEvents = async (): Promise<{
+  success: boolean;
+  events: NotificationEventDefinition[];
+  priorities: NotificationPriorityDefinition[];
+}> => {
+  const result = await get<{ events?: NotificationEventDefinition[]; priorities?: NotificationPriorityDefinition[] }>('/notification-events');
+  return {
+    success: true,
+    events: result?.events || [],
+    priorities: result?.priorities || [],
+  };
+}
+
 export const getMessageNotifications = async (): Promise<{ success: boolean; data: MessageNotification[] }> => {
   const result = await get<Record<string, any[]>>('/message-notifications');
   const notifications: MessageNotification[] = [];
@@ -752,6 +1103,9 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
           channel_id: item.channel_id,
           channel_name: item.channel_name,
           channel_type: item.channel_type,
+          channel_enabled: item.channel_enabled !== false,
+          name: item.name ?? null,
+          event_types: item.event_types ?? null,
           enabled: item.enabled,
         });
       }
@@ -760,8 +1114,28 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
   return { success: true, data: notifications };
 }
 
-export const setMessageNotification = async (cookieId: string, channelId: number, enabled: boolean): Promise<ApiResponse> => {
-  return post(`/message-notifications/${cookieId}`, { channel_id: channelId, enabled });
+export const setMessageNotification = async (
+  cookieId: string,
+  channelId: number,
+  enabled: boolean,
+  rule?: { name?: string; eventTypes?: string[] | null },
+): Promise<ApiResponse & { id?: number }> => {
+  return post(`/message-notifications/${cookieId}`, {
+    channel_id: channelId,
+    enabled,
+    ...(rule ? { name: rule.name ?? '', event_types: rule.eventTypes ?? [] } : {}),
+  });
+}
+
+export const updateMessageNotificationRule = async (
+  ruleId: string,
+  data: { name?: string; eventTypes?: string[]; enabled?: boolean },
+): Promise<ApiResponse> => {
+  const payload: Record<string, unknown> = {};
+  if (data.name !== undefined) payload.name = data.name;
+  if (data.eventTypes !== undefined) payload.event_types = data.eventTypes;
+  if (data.enabled !== undefined) payload.enabled = data.enabled;
+  return put(`/message-notifications/rule/${ruleId}`, payload);
 }
 
 export const deleteMessageNotification = async (notificationId: string): Promise<ApiResponse> => {
@@ -770,6 +1144,25 @@ export const deleteMessageNotification = async (notificationId: string): Promise
 
 export const deleteAccountNotifications = async (cookieId: string): Promise<ApiResponse> => {
   return del(`/message-notifications/account/${cookieId}`);
+}
+
+export interface NotificationTestResponse {
+  success: boolean;
+  message: string;
+  request_id: string;
+  channel: {
+    id: number;
+    name: string;
+    type: NotificationChannelType;
+  };
+  sent_at: string;
+  duration_ms?: number;
+}
+
+export const testMessageNotification = async (
+  ruleId: string | number,
+): Promise<NotificationTestResponse> => {
+  return post(`/message-notifications/rule/${ruleId}/test`);
 }
 
 export const getRiskControlLogs = async (params: {
@@ -938,3 +1331,136 @@ export const deleteDefaultReply = async (cookieId: string): Promise<ApiResponse>
 export const clearDefaultReplyRecords = async (cookieId: string): Promise<ApiResponse> => {
   return post(`/default-replies/${cookieId}/clear-records`, {});
 };
+
+// 全局公告与版本检查：后端代拉公网 JSON 并缓存，force 用于「立即检查更新」
+export const getAnnouncement = async (force = false): Promise<AnnouncementPayload> => {
+  return get('/api/announcement', force ? { force: true } : undefined);
+};
+
+// 物流报价表解析（识别结果持久化，支持多份报价表）
+export interface LogisticsQuoteTier {
+  min_exclusive_kg?: number;
+  max_inclusive_kg?: number;
+  price_per_kg: number;
+  basis?: 'continued' | 'total';
+}
+
+export interface LogisticsQuoteFixedTier {
+  up_to_kg: number;
+  price: number;
+  up_to?: boolean;
+}
+
+export interface LogisticsQuoteCarrier {
+  name: string;
+  sheets: string[];
+  source: 'sheet_name' | 'carrier_column' | 'mixed';
+  carrier_column: string | null;
+  first_source_row: number | null;
+}
+
+export interface LogisticsQuoteParseRow {
+  id: string;
+  sheet: string;
+  source_row: number;
+  seller: string | null;
+  channel: string | null;
+  carrier: string | null;
+  carrier_source: string | null;
+  route: string | null;
+  eta: string | null;
+  origin_province: string | null;
+  origin_city: string | null;
+  origin: string | null;
+  destination_province: string | null;
+  destination_city: string | null;
+  destination: string | null;
+  first_weight_kg: number | null;
+  first_price: number | null;
+  continued_unit_kg: number | null;
+  continued_price: number | null;
+  continued_tiers: LogisticsQuoteTier[] | null;
+  fixed_tiers: LogisticsQuoteFixedTier[] | null;
+  rule_type: 'first_additional' | 'fixed_tiers' | 'fixed_tiers_overflow' | 'banded_additional' | 'minimum_then_per_kg' | null;
+  book_kind: 'express' | 'logistics' | null;
+  quote: number | null;
+  confidence: number;
+  review_state: 'valid' | 'review' | 'rejected';
+  issues: string[];
+  raw: Record<string, string>;
+}
+
+export interface LogisticsQuoteParseResponse {
+  success: boolean;
+  mode?: 'carrier_only' | 'rate_book_summary';
+  source: {
+    filename: string;
+    size: number;
+    sha256: string;
+    content_type: string | null;
+    file_type: 'xlsx' | 'xlsm' | 'xls' | 'csv';
+    parser_version: string;
+    status: 'parsed' | 'needs_review';
+  };
+  mapping: { matched: Record<string, string>; unmatched: string[] };
+  summary: { total: number; valid: number; review: number; rejected: number };
+  book_kind: 'express' | 'logistics' | null;
+  service_count: number;
+  route_count: number;
+  services: Array<{
+    name: string;
+    sheet_name: string;
+    row_count: number;
+    route_count: number;
+    rule_type: string;
+    book_kind: 'express' | 'logistics' | null;
+    mapping: Record<string, string>;
+  }>;
+  carriers: LogisticsQuoteCarrier[];
+  rows: LogisticsQuoteParseRow[];
+  sample_row: LogisticsQuoteParseRow | null;
+  warning_count: number;
+  warnings: string[];
+}
+
+export const parseQuoteSource = async (file: File): Promise<LogisticsQuoteParseResponse> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  return post('/api/logistics/quote-sources/parse', formData);
+};
+
+export interface LogisticsQuoteBook {
+  id: number;
+  filename: string;
+  file_type: string;
+  size_bytes: number;
+  sha256: string;
+  book_kind: 'express' | 'logistics' | null;
+  service_count: number;
+  route_count: number;
+  payload: Omit<LogisticsQuoteParseResponse, 'success'>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export const listQuoteBooks = async (): Promise<{ success: boolean; books: LogisticsQuoteBook[] }> =>
+  get('/api/logistics/quote-books');
+
+export interface QuoteBookRouteSync {
+  id: number;
+  route_count: number;
+}
+
+export const createQuoteBook = async (file: File): Promise<{
+  success: boolean;
+  book: LogisticsQuoteBook;
+  route_import: QuoteBookRouteSync | null;
+  route_warning: string;
+}> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  return post('/api/logistics/quote-books', formData);
+};
+
+export const deleteQuoteBook = async (bookId: number): Promise<{ success: boolean }> =>
+  del(`/api/logistics/quote-books/${bookId}`);

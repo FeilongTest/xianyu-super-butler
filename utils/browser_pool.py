@@ -8,7 +8,9 @@ import os
 from typing import Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 from loguru import logger
+from utils import browser_limit
 from collections import defaultdict
+from utils.user_agents import CHROME_UA
 
 
 class BrowserPool:
@@ -186,15 +188,16 @@ class BrowserPool:
                 ])
 
             # 启动浏览器
-            browser = await playwright.chromium.launch(
-                headless=headless,
-                args=browser_args
+            browser = await browser_limit.launch_browser(
+                playwright,
+                {'headless': headless, 'args': browser_args},
+                "浏览器池",
             )
 
             # 创建浏览器上下文
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                user_agent=CHROME_UA
             )
 
             # 设置Cookie

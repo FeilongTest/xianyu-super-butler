@@ -4,17 +4,12 @@
 """
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
-from pathlib import Path
-from typing import Optional, List
 import asyncio
-import os
+import time
 from loguru import logger
 
 from utils.captcha_remote_control import captcha_controller
-
-CONTROL_PAGE = Path(__file__).resolve().parent.parent / "static" / "captcha_control.html"
 
 # 创建路由器
 router = APIRouter(prefix="/api/captcha", tags=["captcha"])
@@ -47,9 +42,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     
     # 注册 WebSocket 连接
     captcha_controller.websocket_connections[session_id] = websocket
-    
+
     try:
         # 发送初始会话信息
+        # 后端 start_manual_captcha → open_manual_session 要先抢 browser_limit 槽位
+        # 才能打开浏览器截图建会话，前端 WebSocket 可能比会话创建先到。原实现在
+        # 会话不存在时立即发 error + close，前端静默重连但看不到任何反馈，
+        # 弹窗一直停在「正在服务器上打开验证页面」。这里改为轮询等待最多 30 秒，
+        # 给后端足够时间完成浏览器启动和截图。
+        if session_id not in captcha_controller.active_sessions:
+            wait_deadline = time.monotonic() + 30
+            while time.monotonic() < wait_deadline:
+                await asyncio.sleep(1)
+                if session_id in captcha_controller.active_sessions:
+                    break
+            else:
+                await websocket.send_json({
+                    'type': 'error',
+                    'message': '会话创建超时，可能是服务器繁忙或浏览器启动失败，请稍后重试'
+                })
+                await websocket.close()
+                return
+
         if session_id in captcha_controller.active_sessions:
             session_data = captcha_controller.active_sessions[session_id]
             await websocket.send_json({
@@ -275,41 +289,3 @@ async def get_captcha_status(session_id: str):
             "session_id": session_id,
             "error": str(e)
         }
-
-
-@router.get("/control", response_class=HTMLResponse)
-async def captcha_control_page():
-    """返回滑块控制页面"""
-    if CONTROL_PAGE.exists():
-        return FileResponse(CONTROL_PAGE, media_type="text/html")
-    else:
-        # 返回简单的提示页面
-        return HTMLResponse(content="""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>验证码控制面板</title>
-        </head>
-        <body>
-            <h1>验证码控制面板</h1>
-            <p>前端页面文件 captcha_control.html 不存在</p>
-            <p>请查看文档了解如何创建前端页面</p>
-        </body>
-        </html>
-        """)
-
-
-@router.get("/control/{session_id}", response_class=HTMLResponse)
-async def captcha_control_page_with_session(session_id: str):
-    """返回带会话ID的滑块控制页面"""
-    if CONTROL_PAGE.exists():
-        with CONTROL_PAGE.open('r', encoding='utf-8') as f:
-            html_content = f.read()
-            # 注入会话ID
-            html_content = html_content.replace(
-                '</body>',
-                f'<script>window.INITIAL_SESSION_ID = "{session_id}";</script></body>'
-            )
-            return HTMLResponse(content=html_content)
-    else:
-        raise HTTPException(status_code=404, detail="前端页面不存在")

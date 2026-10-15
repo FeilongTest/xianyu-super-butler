@@ -26,7 +26,13 @@ RUN VITE_OUT_DIR=dist npm run build
 
 FROM base AS builder
 
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 主源用阿里云，清华与中科大作为备用。任一镜像临时故障（例如清华曾对部分
+# 文件返回 403）都会让整个镜像构建失败，配上 extra-index 后 pip 会自动换源重试。
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_EXTRA_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple https://pypi.mirrors.ustc.edu.cn/simple" \
+    PIP_RETRIES=5 \
+    PIP_TIMEOUT=60 \
+    PIP_TRUSTED_HOST="mirrors.aliyun.com pypi.tuna.tsinghua.edu.cn pypi.mirrors.ustc.edu.cn"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
@@ -47,7 +53,7 @@ COPY --from=frontend-builder /frontend/dist ./static
 FROM base AS runtime
 
 LABEL maintainer="23Star" \
-      version="2.5.0" \
+      version="3.0.0-beta" \
       description="Xianyu account, item, order, reply, and delivery management" \
       repository="https://github.com/23Star/xianyu-super-butler" \
       author="23Star"
@@ -60,7 +66,11 @@ RUN apt-get update && \
         fonts-dejavu-core \
         fonts-liberation \
         libgl1 \
-        libglib2.0-0 && \
+        libglib2.0-0 \
+        xvfb \
+        x11-utils \
+        nodejs \
+        npm && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -68,6 +78,10 @@ COPY --from=builder /app /app
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Chromium 走国内镜像下载。apt/npm/pip 都换了源，唯独 playwright 仍走官方 CDN 时，
+# 国内构建会卡在这一步直到超时，表现为"镜像构建失败、无法部署"。
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 
 RUN playwright install-deps chromium && \
     playwright install chromium && \

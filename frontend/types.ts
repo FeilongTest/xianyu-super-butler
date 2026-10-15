@@ -13,6 +13,8 @@ export interface PaginatedResponse<T> {
   page: number;
   page_size: number;
   total_pages: number;
+  // 各状态的全量条数，不受分页和筛选影响
+  status_counts?: Record<string, number>;
 }
 
 // Auth
@@ -23,6 +25,8 @@ export interface LoginResponse {
   user_id?: number;
   username?: string;
   is_admin?: boolean;
+  /** true 表示连续登录失败已达阈值，下一次登录必须携带图形验证码 */
+  captcha_required?: boolean;
 }
 
 // Accounts
@@ -48,7 +52,7 @@ export interface AccountDetail {
   followers?: number;
   following?: number;
   profile_updated_at?: string;
-  runtime_state?: 'running' | 'stopped' | 'cancelled' | 'failed';
+  runtime_state?: 'running' | 'connecting' | 'need_relogin' | 'stopped' | 'cancelled' | 'failed';
   // AI设置
   ai_enabled?: boolean;
   max_discount_percent?: number;
@@ -90,11 +94,29 @@ export interface Order {
   buyer_id: string;
   quantity: number;
   amount: string;
+  buy_num?: number;
+  auction_price?: string;
+  confirm_fee?: string;
+  refund_fee?: string;
+  post_fee?: string;
   status: OrderStatus;
   order_status?: OrderStatus;
   receiver_name?: string;
   receiver_phone?: string;
   receiver_address?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+// 快捷短语：人工客服常用话术
+export interface QuickPhrase {
+  id: number;
+  category: string;
+  title: string;
+  content: string;
+  sort_order: number;
+  enabled: boolean;
+  use_count: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -122,8 +144,25 @@ export interface Card {
   image_url?: string;
   // 通用配置
   delay_seconds?: number;
+  // 发货详情文案：开关、文案内容（{参数}/{分隔符}/{图片N}）、图片映射（N -> url）
+  delivery_template?: string;
+  delivery_template_enabled?: boolean;
+  delivery_template_images?: Record<string, string>;
   created_at: string;
   updated_at: string;
+}
+
+/** 批量卡密每发出一行生成一条已发货记录。 */
+export interface CardShipment {
+  id: number;
+  card_id?: number;
+  card_name: string;
+  content: string;
+  order_id: string;
+  item_id: string;
+  buyer_id: string;
+  cookie_id: string;
+  shipped_at: string;
 }
 
 // Items
@@ -139,6 +178,11 @@ export interface Item {
   item_category?: string;
   is_multi_spec?: number | boolean;
   multi_quantity_delivery?: number | boolean;
+  /** 'on_sale' | 'off_shelf'：闲鱼接口是否还返回这件商品。
+   *  同步只做 upsert，下架或删除的商品会留在库里，靠这个字段区分。 */
+  listing_status?: string;
+  /** 最后一次被闲鱼接口返回的时间，用于在误判时提供依据。 */
+  last_seen_at?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -348,7 +392,24 @@ export interface MessageNotification {
   channel_id: number;
   channel_name: string;
   channel_type?: NotificationChannelType;
+  channel_enabled?: boolean;
+  name?: string | null;
+  event_types?: string[] | null;
   enabled: boolean;
+}
+
+export type NotificationPriority = 'critical' | 'warning' | 'info';
+
+export interface NotificationEventDefinition {
+  id: string;
+  label: string;
+  priority: NotificationPriority;
+  description: string;
+}
+
+export interface NotificationPriorityDefinition {
+  id: NotificationPriority;
+  label: string;
 }
 
 export interface RiskControlLog {
@@ -456,12 +517,40 @@ export interface AdminStats {
   total_orders: number;
 }
 
+// 用户管理（管理员专用）。内置 admin 是唯一管理员，其余注册用户均为普通用户。
+export interface AdminUser {
+  id: number;
+  username: string;
+  email: string;
+  is_active?: boolean;
+  cookie_count?: number;
+  card_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface OrderAnalytics {
   revenue_stats: {
     total_amount: number;
     total_orders: number;
+    avg_amount?: number;
+    unique_buyers?: number;
+    unique_items?: number;
+    // 确认收货后卖家实收，退款订单为 0
+    confirmed_amount?: number;
+    refunded_amount?: number;
+    total_items_sold?: number;
+    // 全部状态的口径，与订单页数字一致
+    all_orders?: number;
+    all_amount?: number;
   };
-  daily_stats: Array<{ date: string; amount: number }>;
+  daily_stats: Array<{
+    date: string;
+    amount: number;
+    order_count?: number;
+    confirmed_amount?: number;
+    refunded_amount?: number;
+  }>;
   item_stats?: Array<{
     item_id: string;
     order_count: number;
@@ -477,6 +566,29 @@ export interface SystemSettings {
   ai_base_url?: string;
   default_reply?: string;
   registration_enabled?: boolean;
+  // 注册是否必须填邮箱验证码。没配 SMTP 时关掉，否则注册会卡在收不到验证码
+  email_verification_enabled?: boolean;
+  // 定时从卖家端拉取订单，默认开启
+  order_sync_enabled?: boolean;
+  order_sync_interval?: number;
+  // 商品擦亮，默认关闭
+  auto_polish_enabled?: boolean;
+  auto_polish_interval?: number;
+  // 对买家产生实际动作，默认关闭
+  auto_rate_enabled?: boolean;
+  // 订单页评价框的预填文案，避免每单重复手打
+  auto_rate_template?: string;
+  /** 确认收货致谢文案，全账号共用 */
+  auto_thanks_template?: string;
+  /** 买家互动兜底轮询间隔（秒）。确认收货已由消息事件即时触发，这里只是兜底。 */
+  buyer_interaction_interval?: string | number;
+  auto_flower_enabled?: boolean;
+  // 公告与更新：地址存为字符串，开关也用字符串以复用通用设置接口
+  announcement_source_url?: string;
+  announcement_enabled?: string;
+  // 公告与版本提示分开控制展示，未设置时按展示处理
+  announcement_show_notice?: boolean;
+  announcement_show_update?: boolean;
   smtp_server?: string;
   [key: string]: any;
 }
@@ -487,6 +599,7 @@ export interface AIReplySettings {
   api_key: string;
   api_key_configured?: boolean;
   base_url: string;
+  user_agent?: string;
   max_discount_percent: number;
   max_discount_amount?: number;
   max_bargain_rounds: number;
@@ -503,4 +616,24 @@ export interface DefaultReply {
   reply_content: string;
   reply_once: boolean;
   reply_image_url?: string;
+}
+
+// 全局公告与版本检查
+export interface AnnouncementItem {
+  id: string;
+  title: string;
+  content: string;
+  level: 'info' | 'warning' | 'danger';
+  published_at: string;
+}
+
+export interface AnnouncementPayload {
+  local_version: string;
+  latest_version: string;
+  download_url: string;
+  release_notes: string;
+  has_update: boolean;
+  source_configured: boolean;
+  error: string;
+  announcements: AnnouncementItem[];
 }
